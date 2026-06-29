@@ -52,11 +52,9 @@ CHANGE_POSITION_MODE_URL = "v3/positionSide/dual"
 POST_POSITION_MODE_LIMIT_ID = f"POST{CHANGE_POSITION_MODE_URL}"
 GET_POSITION_MODE_LIMIT_ID = f"GET{CHANGE_POSITION_MODE_URL}"
 
-# Private API v2 Endpoints
-ACCOUNT_INFO_URL = "v2/account"
+# Private API v3 Endpoints
+ACCOUNT_INFO_URL = "v3/account"
 POSITION_INFORMATION_URL = "v2/positionRisk"
-
-# Private API v1 Endpoints
 ACCOUNT_TRADE_LIST_URL = "v1/userTrades"
 GET_INCOME_HISTORY_URL = "v1/income"
 
