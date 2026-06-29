@@ -133,10 +133,10 @@ class AsterPerpetualDerivative(PerpetualDerivativePyBase):
         return trading_rule.sell_order_collateral_token
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
+        if isinstance(request_exception, dict):
+            return str(request_exception.get("code")) == "-1021"
         error_description = str(request_exception)
-        is_time_synchronizer_related = ("-1021" in error_description
-                                        and "Timestamp for this request" in error_description)
-        return is_time_synchronizer_related
+        return "-1021" in error_description and "Timestamp for this request" in error_description
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         return str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in str(
@@ -346,7 +346,7 @@ class AsterPerpetualDerivative(PerpetualDerivativePyBase):
         )
         return _order_update
 
-    async def _iter_user_event_queue(self) -> AsyncIterable[Dict[str, any]]:
+    async def _iter_user_event_queue(self) -> AsyncIterable[Dict[str, Any]]:
         while True:
             try:
                 yield await self._user_stream_tracker.user_stream.get()
@@ -474,7 +474,7 @@ class AsterPerpetualDerivative(PerpetualDerivativePyBase):
         for rule in rules:
             try:
                 if web_utils.is_exchange_information_valid(rule):
-                    trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule["symbol"])
+                    trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule["pair"])
                     filters = rule["filters"]
                     filt_dict = {fil["filterType"]: fil for fil in filters}
 

@@ -1,3 +1,4 @@
+import json
 import time
 from collections import OrderedDict
 from typing import Any, Dict
@@ -73,7 +74,6 @@ class AsterPerpetualAuth(AuthBase):
             timestamp = self._next_nonce()
 
             if request.method == RESTMethod.POST and request.data:
-                import json
                 params = json.loads(request.data)
                 request.data = None
             else:
