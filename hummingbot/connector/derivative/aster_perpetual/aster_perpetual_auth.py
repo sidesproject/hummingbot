@@ -4,7 +4,7 @@ from typing import Any, Dict
 from urllib.parse import urlencode
 
 from eth_account import Account
-from eth_account.messages import encode_structured_data
+from eth_account.messages import encode_typed_data
 
 import hummingbot.connector.derivative.aster_perpetual.aster_perpetual_constants as CONSTANTS
 from hummingbot.core.web_assistant.auth import AuthBase
@@ -65,7 +65,7 @@ class AsterPerpetualAuth(AuthBase):
                 "msg": encoded_params,
             },
         }
-        structured_msg = encode_structured_data(typed_data)
+        structured_msg = encode_typed_data(typed_data)
         signed = self._trading_wallet.sign_message(structured_msg)
         return signed.signature.hex()
 
