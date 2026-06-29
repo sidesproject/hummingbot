@@ -15,9 +15,7 @@ class AsterPerpetualRESTPreProcessor(RESTPreProcessorBase):
     async def pre_process(self, request: RESTRequest) -> RESTRequest:
         if request.headers is None:
             request.headers = {}
-        request.headers["Content-Type"] = (
-            "application/json" if request.method == RESTMethod.POST else "application/x-www-form-urlencoded"
-        )
+        request.headers["Content-Type"] = "application/x-www-form-urlencoded"
         return request
 
 

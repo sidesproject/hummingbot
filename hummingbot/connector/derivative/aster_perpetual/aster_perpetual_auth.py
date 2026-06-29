@@ -65,7 +65,7 @@ class AsterPerpetualAuth(AuthBase):
                 "msg": encoded_params,
             },
         }
-        structured_msg = encode_typed_data(typed_data)
+        structured_msg = encode_typed_data(full_message=typed_data)
         signed = self._trading_wallet.sign_message(structured_msg)
         return signed.signature.hex()
 
