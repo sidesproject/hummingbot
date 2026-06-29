@@ -8,15 +8,15 @@ MAX_ORDER_ID_LEN = 32
 DOMAIN = EXCHANGE_NAME
 TESTNET_DOMAIN = "aster_perpetual_testnet"
 
-PERPETUAL_BASE_URL = "https://fapi3.asterdex.com/fapi/"
+PERPETUAL_BASE_URL = "https://fapi.asterdex.com/fapi/"
 TESTNET_BASE_URL = "https://fapi.asterdex-testnet.com/fapi/"
 
 PERPETUAL_WS_URL = "wss://fstream.asterdex.com/"
 TESTNET_WS_URL = "wss://fstream.asterdex-testnet.com/"
 
-PUBLIC_WS_ENDPOINT = "public/stream"
-MARKET_WS_ENDPOINT = "market/stream"
-PRIVATE_WS_ENDPOINT = "private/ws"
+PUBLIC_WS_ENDPOINT = "stream"   # wss://fstream.asterdex.com/stream?streams=... (combined)
+MARKET_WS_ENDPOINT = "stream"   # same host, combined streams for aggTrade / markPrice
+PRIVATE_WS_ENDPOINT = "ws"      # wss://fstream.asterdex.com/ws/<listenKey>
 
 # EIP-712 Signing Domain
 EIP712_DOMAIN_NAME = "AsterSignTransaction"

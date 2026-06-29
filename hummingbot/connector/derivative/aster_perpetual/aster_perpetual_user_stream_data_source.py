@@ -130,7 +130,7 @@ class AsterPerpetualUserStreamDataSource(UserStreamTrackerDataSource):
         await self._ensure_listen_key_task_running()
         await self._listen_key_initialized_event.wait()
         ws = await self._get_ws_assistant()
-        url = f"{web_utils.wss_url(CONSTANTS.PRIVATE_WS_ENDPOINT, self._domain)}?listenKey={self._current_listen_key}"
+        url = f"{web_utils.wss_url(CONSTANTS.PRIVATE_WS_ENDPOINT, self._domain)}/{self._current_listen_key}"
         self.logger().info(f"Connecting to user stream with listen key {self._current_listen_key}")
         await ws.connect(ws_url=url, ping_timeout=self.HEARTBEAT_TIME_INTERVAL)
         self.logger().info("Successfully connected to user stream")
