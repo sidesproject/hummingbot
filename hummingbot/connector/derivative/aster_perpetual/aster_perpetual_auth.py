@@ -79,7 +79,6 @@ class AsterPerpetualAuth(AuthBase):
             else:
                 params = dict(request.params or {})
 
-            params["user"] = self._main_address
             params["signer"] = self._trading_address
             params["nonce"] = str(timestamp)
 
