@@ -697,7 +697,7 @@ class AsterPerpetualDerivative(PerpetualDerivativePyBase):
         initial_mode = await self._get_position_mode()
         if initial_mode != mode:
             params = {
-                "dualSidePosition": True if mode == PositionMode.HEDGE else False,
+                "dualSidePosition": "true" if mode == PositionMode.HEDGE else "false",
             }
             response = await self._api_post(
                 path_url=CONSTANTS.CHANGE_POSITION_MODE_URL,
