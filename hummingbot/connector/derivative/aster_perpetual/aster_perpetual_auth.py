@@ -73,9 +73,10 @@ class AsterPerpetualAuth(AuthBase):
         if request.is_auth_required:
             timestamp = self._next_nonce()
 
-            if request.method == RESTMethod.POST:
+            if request.method == RESTMethod.POST and request.data:
                 import json
-                params = json.loads(request.data) if request.data else {}
+                params = json.loads(request.data)
+                request.data = None  # clear body; Aster uses URL query params for all requests
             else:
                 params = dict(request.params or {})
 
