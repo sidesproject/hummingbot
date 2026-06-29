@@ -45,8 +45,7 @@ class AsterPerpetualAuth(AuthBase):
         self._last_nonce_us = max(now_us, self._last_nonce_us + 1)
         return self._last_nonce_us
 
-    def _sign_params(self, params: Dict[str, Any]) -> str:
-        encoded_params = urlencode(params)
+    def _sign_param_str(self, param_str: str) -> str:
         typed_data = {
             "types": {
                 "EIP712Domain": [
@@ -62,7 +61,7 @@ class AsterPerpetualAuth(AuthBase):
             "primaryType": "Message",
             "domain": self._get_eip712_domain(),
             "message": {
-                "msg": encoded_params,
+                "msg": param_str,
             },
         }
         structured_msg = encode_typed_data(full_message=typed_data)
@@ -76,7 +75,7 @@ class AsterPerpetualAuth(AuthBase):
             if request.method == RESTMethod.POST and request.data:
                 import json
                 params = json.loads(request.data)
-                request.data = None  # clear body; Aster uses URL query params for all requests
+                request.data = None
             else:
                 params = dict(request.params or {})
 
@@ -84,9 +83,10 @@ class AsterPerpetualAuth(AuthBase):
             params["signer"] = self._trading_address
             params["nonce"] = str(timestamp)
 
-            request.params = OrderedDict(params)
-            signature = self._sign_params(request.params)
-            request.params["signature"] = signature
+            param_str = urlencode(params)
+            signature = self._sign_param_str(param_str)
+            request.params = None
+            request.url = f"{request.url}?{param_str}&signature={signature}"
 
         return request
 
