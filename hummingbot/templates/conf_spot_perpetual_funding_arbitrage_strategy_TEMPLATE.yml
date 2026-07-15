@@ -1,0 +1,62 @@
+################################################
+###   Spot-Perpetual Funding Arbitrage config   ###
+################################################
+
+template_version: 3
+strategy: null
+
+# Connectors and tokens parameters
+spot_connector: null
+perpetual_connector: null
+
+# Tokens to trade, separated by commas (e.g. BTC,ETH)
+tokens: null
+
+# Total quote asset (e.g. USDT) to allocate across all tokens
+# Will be split proportionally by funding rate
+total_order_amount_quote: null
+
+# Leverage on the perpetual exchange (1 = 1X)
+perpetual_leverage: null
+
+# Minimum funding rate (%) to open a position
+min_funding_rate_pct: null
+
+# Funding rate (%) at which to close the position
+exit_funding_rate_pct: null
+
+# Take profit percentage of position value
+take_profit_pct: null
+
+# Stop loss percentage of position value (enter negative value)
+stop_loss_pct: null
+
+# Slippage buffer on spot orders (Enter 1 for 1%)
+spot_market_slippage_buffer: null
+
+# Slippage buffer on perpetual orders (Enter 1 for 1%)
+perpetual_market_slippage_buffer: null
+
+# Delay before opening the next position after closing (in seconds)
+next_arbitrage_opening_delay: null
+
+# Minimum holding time (hours) before exit due to funding rate drop
+min_holding_hours: null
+
+# Cooldown time (hours) after closing before re-entering
+reopen_cooldown_hours: null
+
+# Maximum spot-perp spread (%) allowed when entering
+max_entry_spread_pct: null
+
+# Maximum ratio of entry spread to funding rate
+max_spread_to_funding_ratio: null
+
+# Maximum exit spread (%) when closing (stop loss ignores this)
+max_exit_spread_pct: null
+
+# How often to check for new entry opportunities (in seconds)
+check_interval_seconds: null
+
+# How often to run health check that detects orphaned positions (in seconds)
+health_check_interval_seconds: null
