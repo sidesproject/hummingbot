@@ -1,0 +1,1070 @@
+import logging
+from dataclasses import dataclass, field
+from decimal import Decimal
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+
+from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.derivative.position import Position
+from hummingbot.core.clock import Clock
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
+from hummingbot.core.data_type.funding_info import FundingInfo
+from hummingbot.core.data_type.limit_order import LimitOrder
+from hummingbot.core.data_type.market_order import MarketOrder
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    BuyOrderCreatedEvent,
+    FundingPaymentCompletedEvent,
+    MarketOrderFailureEvent,
+    PositionModeChangeEvent,
+    SellOrderCompletedEvent,
+    SellOrderCreatedEvent,
+)
+from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.logger import HummingbotLogger
+from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
+from hummingbot.strategy.strategy_py_base import StrategyPyBase
+
+NaN = float("nan")
+s_decimal_zero = Decimal(0)
+spfa_logger = None
+
+
+class StrategyState(Enum):
+    Closed = 0
+    Opening = 1
+    Opened = 2
+    Closing = 3
+
+
+@dataclass
+class TokenState:
+    """Per-token state that tracks one independent arbitrage position."""
+    token: str
+    spot_trading_pair: str
+    perp_trading_pair: str
+    spot_tuple: MarketTradingPairTuple = None
+    perp_tuple: MarketTradingPairTuple = None
+    state: StrategyState = StrategyState.Closed
+    entry_funding_rate: Decimal = Decimal(0)
+    execution_purpose: str = ""  # "open" | "add" | "close"
+    accumulated_funding: Decimal = Decimal(0)
+    position_opened_ts: float = 0
+    last_closed_ts: float = 0
+    next_arbitrage_opening_ts: float = 0
+    execution_tracker: Dict[str, dict] = field(default_factory=dict)
+    execution_expected_count: int = 0
+    execution_started_ts: float = 0  # for stuck-in-flight detection
+
+
+
+STUCK_IN_FLIGHT_TIMEOUT = 300  # seconds after which stuck Opening/Closing is force-reset
+
+
+class ExecPurpose:
+    OPEN = "open"
+    ADD = "add"
+    CLOSE = "close"
+
+
+class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
+    """
+    Delta-neutral funding rate arbitrage between spot and perpetual markets.
+
+    Supports multiple tokens simultaneously. Each token runs an independent
+    state machine: when funding rate is positive, SHORT perpetual + LONG spot.
+
+    Entry guards:
+      - funding_rate >= min_funding_rate_pct
+      - spot-perp spread <= max_entry_spread_pct
+      - spread / funding_rate <= max_spread_to_funding_ratio
+
+    Exit conditions (per token):
+      1. Funding rate drops below exit_funding_rate_pct (after min_holding_hours)
+      2. Total PnL >= take_profit_pct of position value
+      3. Total PnL <= stop_loss_pct (always closes immediately, ignores spread)
+
+    Exit guard:
+      - exit spread <= max_exit_spread_pct (skipped for stop loss)
+    """
+
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        global spfa_logger
+        if spfa_logger is None:
+            spfa_logger = logging.getLogger(__name__)
+        return spfa_logger
+
+    def init_params(
+        self,
+        spot_market_info: MarketTradingPairTuple,
+        perp_market_info: MarketTradingPairTuple,
+        tokens: List[str],
+        total_order_amount_quote: Decimal,
+        perp_leverage: int,
+        min_funding_rate_pct: Decimal,
+        exit_funding_rate_pct: Decimal,
+        take_profit_pct: Decimal,
+        stop_loss_pct: Decimal,
+        spot_market_slippage_buffer: Decimal = Decimal("0"),
+        perp_market_slippage_buffer: Decimal = Decimal("0"),
+        next_arbitrage_opening_delay: float = 120,
+        min_holding_hours: float = 4,
+        reopen_cooldown_hours: float = 2,
+        max_entry_spread_pct: Decimal = Decimal("0.05"),
+        max_spread_to_funding_ratio: Decimal = Decimal("3"),
+        max_exit_spread_pct: Decimal = Decimal("0.08"),
+        check_interval_seconds: float = 30,
+        health_check_interval_seconds: float = 60,
+        status_report_interval: float = 10,
+    ):
+        self._spot_market_info = spot_market_info
+        self._perp_market_info = perp_market_info
+        self._spot_market = spot_market_info.market
+        self._perp_market = perp_market_info.market
+        self._tokens = tokens
+        self._total_order_amount_quote = total_order_amount_quote
+        self._perp_leverage = perp_leverage
+        self._min_funding_rate_pct = min_funding_rate_pct
+        self._exit_funding_rate_pct = exit_funding_rate_pct
+        self._take_profit_pct = take_profit_pct
+        self._stop_loss_pct = stop_loss_pct
+        self._spot_market_slippage_buffer = spot_market_slippage_buffer
+        self._perp_market_slippage_buffer = perp_market_slippage_buffer
+        self._next_arbitrage_opening_delay = next_arbitrage_opening_delay
+        self._min_holding_seconds = min_holding_hours * 3600
+        self._reopen_cooldown_seconds = reopen_cooldown_hours * 3600
+        self._max_entry_spread_pct = max_entry_spread_pct
+        self._max_spread_to_funding_ratio = max_spread_to_funding_ratio
+        self._max_exit_spread_pct = max_exit_spread_pct
+        self._check_interval_seconds = check_interval_seconds
+        self._health_check_interval_seconds = health_check_interval_seconds
+        self._status_report_interval = status_report_interval
+
+        spot_connector_name = spot_market_info.market.name
+        perp_connector_name = perp_market_info.market.name
+        self._quote_map = {
+            spot_connector_name: spot_market_info.quote_asset,
+            perp_connector_name: perp_market_info.quote_asset,
+        }
+
+        self._token_states: Dict[str, TokenState] = {}
+        for token in tokens:
+            spot_pair = f"{token}-{spot_market_info.quote_asset}"
+            perp_pair = f"{token}-{perp_market_info.quote_asset}"
+            spot_tup = MarketTradingPairTuple(
+                spot_market_info.market, spot_pair,
+                token, spot_market_info.quote_asset,
+            )
+            perp_tup = MarketTradingPairTuple(
+                perp_market_info.market, perp_pair,
+                token, perp_market_info.quote_asset,
+            )
+            self._token_states[token] = TokenState(
+                token=token,
+                spot_trading_pair=spot_pair,
+                perp_trading_pair=perp_pair,
+                spot_tuple=spot_tup,
+                perp_tuple=perp_tup,
+            )
+
+        self._all_markets_ready = False
+        self._last_timestamp = 0
+        self.add_markets([spot_market_info.market, perp_market_info.market])
+
+        self._main_task = None
+        self._ready_to_start = False
+        self._last_check_ts: float = 0
+        self._last_health_check_ts: float = 0
+        self._last_log_ts: Dict[str, float] = {}
+        self._position_mode_ready = False
+        self._position_mode_not_ready_counter = 0
+        self._trading_started = False
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _ts_for(self, token: str) -> TokenState:
+        return self._token_states[token]
+
+    def all_markets_ready(self):
+        return all([market.ready for market in self.active_markets])
+
+    @property
+    def perp_positions(self) -> List[Position]:
+        return [
+            s for s in self._perp_market.account_positions.values()
+            if s.amount != s_decimal_zero
+        ]
+
+    def _perp_position_for_token(self, token: str) -> Optional[Position]:
+        pair = self._ts_for(token).perp_trading_pair
+        for pos in self.perp_positions:
+            if pos.trading_pair == pair:
+                return pos
+        return None
+
+    def get_funding_info(self, trading_pair: str) -> Optional[FundingInfo]:
+        try:
+            return self._perp_market.get_funding_info(trading_pair)
+        except Exception:
+            return None
+
+    def _calc_dynamic_allocation(self, entering_token: str, funding_rate_pct: Decimal) -> Decimal:
+        """Allocate remaining capital to a token proportional to funding rate.
+
+        Already-opened positions are NOT rebalanced. Their locked capital is
+        deducted from the total. The remaining capital is distributed among
+        currently eligible Closed tokens (including the one about to enter)
+        in proportion to their funding rates.
+        """
+        remaining = self._total_order_amount_quote - self._locked_capital()
+        if remaining <= s_decimal_zero:
+            return s_decimal_zero
+
+        # Sum funding rates of all eligible Closed tokens
+        pool_rate = s_decimal_zero
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if ts.state != StrategyState.Closed:
+                continue
+            fi = self.get_funding_info(ts.perp_trading_pair)
+            if fi is None:
+                continue
+            fr = fi.rate * Decimal("100")
+            if fr < self._min_funding_rate_pct:
+                continue
+            pool_rate += fr
+
+        if pool_rate == s_decimal_zero:
+            return s_decimal_zero
+
+        share = funding_rate_pct / pool_rate
+        return remaining * share
+
+    def _quote_to_base(self, token: str, quote_amount: Decimal, price: Decimal) -> Decimal:
+        raw = quote_amount / price if price != s_decimal_zero else s_decimal_zero
+        amt = self._spot_market.quantize_order_amount(
+            self._ts_for(token).spot_trading_pair, raw
+        )
+        return max(amt, s_decimal_zero)
+
+    def _locked_capital(self) -> Decimal:
+        locked = s_decimal_zero
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if ts.state in (StrategyState.Opened, StrategyState.Opening):
+                pos = self._perp_position_for_token(token)
+                if pos is not None:
+                    fi = self.get_funding_info(ts.perp_trading_pair)
+                    mark = fi.mark_price if fi else s_decimal_zero
+                    if mark != s_decimal_zero:
+                        locked += abs(pos.amount) * mark
+        return locked
+
+    def apply_initial_settings(self):
+        for token in self._tokens:
+            pair = self._ts_for(token).perp_trading_pair
+            self._perp_market.set_leverage(pair, self._perp_leverage)
+        self._perp_market.set_position_mode(PositionMode.ONEWAY)
+
+    # ------------------------------------------------------------------
+    # Tick / Main loop
+    # ------------------------------------------------------------------
+
+    def tick(self, timestamp: float):
+        if not self._all_markets_ready or not self._position_mode_ready or not self._trading_started:
+            self._all_markets_ready = self.all_markets_ready()
+            if not self._all_markets_ready:
+                return
+            self.logger().info("Markets are ready.")
+
+            if not self._position_mode_ready:
+                self._position_mode_not_ready_counter += 1
+                if self._position_mode_not_ready_counter == 10:
+                    self._perp_market.set_position_mode(PositionMode.ONEWAY)
+                    self._position_mode_not_ready_counter = 0
+                return
+            self._position_mode_not_ready_counter = 0
+
+            self.logger().info("Trading started.")
+            self._trading_started = True
+
+            if not self.check_budget_available():
+                self.logger().info("Trading not possible.")
+                return
+
+            self._ready_to_start = True
+
+        if self._ready_to_start and (self._main_task is None or self._main_task.done()):
+            self._main_task = safe_ensure_future(self.main(timestamp))
+
+    async def main(self, timestamp):
+        self.update_all_strategy_states()
+
+        # Monitoring ALWAYS runs for opened positions (TP/SL checks)
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if ts.state != StrategyState.Opened:
+                continue
+            funding_info = self.get_funding_info(ts.perp_trading_pair)
+            if funding_info is None:
+                continue
+            self._monitor_open_position(token, ts, funding_info)
+
+        # Health check: detect and fix one-sided exposures
+        if self.current_timestamp - self._last_health_check_ts >= self._health_check_interval_seconds:
+            self._last_health_check_ts = self.current_timestamp
+            self._health_check()
+
+        # Entry checks are throttled to check_interval_seconds
+        if self.current_timestamp - self._last_check_ts < self._check_interval_seconds:
+            return
+        self._last_check_ts = self.current_timestamp
+
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if ts.state in (StrategyState.Opening, StrategyState.Closing):
+                continue
+
+            # Don't stack multiple in-flight orders for the same token
+            if ts.execution_expected_count > 0:
+                continue
+
+            if ts.state == StrategyState.Closed:
+                if ts.next_arbitrage_opening_ts > self.current_timestamp:
+                    continue
+                since_close = self.current_timestamp - ts.last_closed_ts
+                if since_close < self._reopen_cooldown_seconds:
+                    continue
+
+            funding_info = self.get_funding_info(ts.perp_trading_pair)
+            if funding_info is None:
+                continue
+            current_funding_rate_pct = funding_info.rate * Decimal("100")
+
+            if current_funding_rate_pct <= s_decimal_zero:
+                continue
+            if current_funding_rate_pct < self._min_funding_rate_pct:
+                continue
+
+            # Dynamic allocation: allocate remaining capital proportional to funding rates
+            alloc_quote = self._calc_dynamic_allocation(token, current_funding_rate_pct)
+            if alloc_quote == s_decimal_zero:
+                continue
+
+            order_amount = self._quote_to_base(token, alloc_quote, funding_info.index_price)
+            if order_amount == s_decimal_zero:
+                continue
+
+            perp_is_buy = False
+            spot_is_buy = True
+            price_perp, price_spot = await self._get_order_prices(
+                ts.spot_trading_pair, ts.perp_trading_pair,
+                perp_is_buy, spot_is_buy, order_amount,
+            )
+            if price_perp is None or price_spot is None:
+                continue
+
+            # Entry spread guards
+            if price_perp != s_decimal_zero:
+                spread_pct = (price_spot - price_perp) / price_perp * Decimal("100")
+                if spread_pct > self._max_entry_spread_pct:
+                    self._log_throttled(token,
+                        f"Entry rejected: spot_buy({price_spot:.2f}) - perp_sell({price_perp:.2f}) "
+                        f"spread ({spread_pct:.4f}%) exceeds max_entry_spread_pct "
+                        f"({self._max_entry_spread_pct:.4f}%).")
+                    continue
+                if current_funding_rate_pct > s_decimal_zero:
+                    ratio = spread_pct / current_funding_rate_pct
+                    if ratio > self._max_spread_to_funding_ratio:
+                        self._log_throttled(token,
+                            f"Entry rejected: spread ({spread_pct:.4f}%) / funding "
+                            f"({current_funding_rate_pct:.4f}%) ratio ({ratio:.1f}) exceeds "
+                            f"max_spread_to_funding_ratio ({self._max_spread_to_funding_ratio:.1f}).")
+                        continue
+
+            is_addition = ts.state == StrategyState.Opened
+            label = "Adding to" if is_addition else "Opening"
+            self.logger().info(
+                f"[{token}] {label} position: rate {current_funding_rate_pct:.4f}%, "
+                f"alloc {alloc_quote:.2f} quote ({order_amount:.6f} {token}), "
+                f"remaining capital ~{self._total_order_amount_quote - self._locked_capital():.2f}."
+            )
+
+            proposal = (spot_is_buy, perp_is_buy, price_spot, price_perp, order_amount)
+            proposal = self.apply_slippage_buffers(proposal, ts)
+            if self.check_budget_constraint(proposal, ts, order_amount):
+                self._execute_arb_parallel(
+                    ts, proposal,
+                    purpose=ExecPurpose.ADD if is_addition else ExecPurpose.OPEN,
+                )
+
+    def _log_throttled(self, token: str, msg: str, interval: float = 60):
+        last = self._last_log_ts.get(token, 0)
+        if self.current_timestamp - last >= interval:
+            self.logger().info(f"[{token}] {msg}")
+            self._last_log_ts[token] = self.current_timestamp
+
+    # ------------------------------------------------------------------
+    # Order price helpers
+    # ------------------------------------------------------------------
+
+    async def _get_order_prices(
+        self, spot_pair: str, perp_pair: str,
+        perp_is_buy: bool, spot_is_buy: bool, order_amount: Decimal,
+    ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        try:
+            price_spot = await self._spot_market.get_order_price(
+                spot_pair, spot_is_buy, order_amount
+            )
+            price_perp = await self._perp_market.get_order_price(
+                perp_pair, perp_is_buy, order_amount
+            )
+            return price_perp, price_spot
+        except Exception as e:
+            self.logger().warning(f"Failed to get order prices: {e}")
+            return None, None
+
+    # ------------------------------------------------------------------
+    # Monitoring & close
+    # ------------------------------------------------------------------
+
+    def _monitor_open_position(self, token: str, ts: TokenState, funding_info: FundingInfo):
+        current_funding_rate_pct = funding_info.rate * Decimal("100")
+        perp_position = self._perp_position_for_token(token)
+        if perp_position is None:
+            self.logger().warning(f"[{token}] No perpetual position found while in Opened state. Resetting.")
+            ts.state = StrategyState.Closed
+            return
+
+        position_amount = abs(perp_position.amount)
+        position_value = position_amount * funding_info.mark_price
+        unrealized = perp_position.unrealized_pnl
+        total_pnl = unrealized + ts.accumulated_funding
+        total_pnl_pct = total_pnl / position_value if position_value != s_decimal_zero else s_decimal_zero
+
+        should_close = False
+        is_stop_loss = False
+
+        holding_seconds = self.current_timestamp - ts.position_opened_ts
+        holding_elapsed = holding_seconds >= self._min_holding_seconds
+
+        if current_funding_rate_pct < self._exit_funding_rate_pct:
+            if not holding_elapsed:
+                remaining = self._min_holding_seconds - holding_seconds
+                self._log_throttled(token,
+                    f"Funding rate ({current_funding_rate_pct:.4f}%) below exit, "
+                    f"but holding not met ({remaining:.0f}s remaining).")
+                return
+            should_close = True
+            self._log_throttled(token,
+                f"Exit: funding rate ({current_funding_rate_pct:.4f}%) < exit "
+                f"({self._exit_funding_rate_pct:.4f}%) after {holding_seconds:.0f}s.")
+
+        elif total_pnl_pct >= self._take_profit_pct:
+            should_close = True
+            self._log_throttled(token,
+                f"Take profit: total PnL ({total_pnl_pct:.4f}%) >= "
+                f"take_profit ({self._take_profit_pct:.4f}%).")
+
+        elif total_pnl_pct <= self._stop_loss_pct:
+            should_close = True
+            is_stop_loss = True
+            self._log_throttled(token,
+                f"Stop loss: total PnL ({total_pnl_pct:.4f}%) <= "
+                f"stop_loss ({self._stop_loss_pct:.4f}%).")
+
+        if should_close:
+            self.logger().info(
+                f"[{token}] PnL — Unrealized: {unrealized:.4f}, "
+                f"Funding: {ts.accumulated_funding:.4f}, "
+                f"Total: {total_pnl:.4f} ({total_pnl_pct:.4f}%)"
+            )
+            safe_ensure_future(self._close_position(token, ts, is_stop_loss))
+
+    async def _close_position(self, token: str, ts: TokenState, is_stop_loss: bool = False):
+        if ts.state != StrategyState.Opened:
+            return
+        perp_position = self._perp_position_for_token(token)
+        if perp_position is None:
+            return
+
+        order_amount = abs(perp_position.amount)
+        open_perp_is_short = perp_position.amount < 0
+        close_perp_is_buy = open_perp_is_short
+        close_spot_is_buy = not open_perp_is_short
+
+        price_perp, price_spot = await self._get_order_prices(
+            ts.spot_trading_pair, ts.perp_trading_pair,
+            perp_is_buy=close_perp_is_buy, spot_is_buy=close_spot_is_buy,
+            order_amount=order_amount,
+        )
+        if price_perp is None or price_spot is None:
+            self.logger().warning(f"[{token}] Failed to get close prices. Retry next tick.")
+            return
+
+        # Exit spread guard (skip for stop loss)
+        if price_perp != s_decimal_zero and not is_stop_loss:
+            exit_spread_pct = (price_perp - price_spot) / price_perp * Decimal("100")
+            if exit_spread_pct > self._max_exit_spread_pct:
+                self._log_throttled(token,
+                    f"Exit postponed: perp_buy({price_perp:.2f}) - spot_sell({price_spot:.2f}) "
+                    f"exit spread ({exit_spread_pct:.4f}%) > max ({self._max_exit_spread_pct:.4f}%).")
+                return
+
+        self.logger().info(f"[{token}] Closing position ({order_amount:.6f} {token})...")
+
+        proposal = (close_spot_is_buy, close_perp_is_buy, price_spot, price_perp, order_amount)
+        proposal = self.apply_slippage_buffers(proposal, ts)
+        if self.check_budget_constraint(proposal, ts, order_amount):
+            self._execute_arb_parallel(ts, proposal, purpose=ExecPurpose.CLOSE)
+
+    # ------------------------------------------------------------------
+    # State machine (per token)
+    # ------------------------------------------------------------------
+
+    def update_all_strategy_states(self):
+        """State transitions are handled inside _check_alignment_and_finalize."""
+        pass
+
+    # ------------------------------------------------------------------
+    # Health check — detect & fix one-sided exposures
+    # ------------------------------------------------------------------
+
+    def _health_check(self):
+        """Periodic safety scan to detect and fix orphaned one-sided positions.
+
+        Scenarios detected:
+          1. State=Closed but perp position exists → orphaned short, force buy-back
+          2. State=Opened but no perp position → orphaned spot, force sell
+          3. State stuck in Opening/Closing for > STUCK_IN_FLIGHT_TIMEOUT → force-reset
+        """
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            pos = self._perp_position_for_token(token)
+            has_perp = pos is not None and pos.amount != s_decimal_zero
+
+            # Scenario 1: state says Closed but perp has a position
+            if ts.state == StrategyState.Closed and has_perp:
+                self.logger().warning(
+                    f"[{token}] HEALTH CHECK: State=Closed but perp position exists "
+                    f"({pos.amount:.6f}, side={pos.position_side.name}). "
+                    f"Force-closing perp side to eliminate exposure."
+                )
+                safe_ensure_future(self._force_close_perp_exposure(token, ts, pos))
+
+            # Scenario 2: state says Opened but no perp position → orphaned spot
+            elif ts.state == StrategyState.Opened and not has_perp:
+                spot_bal = self._spot_market.get_available_balance(token)
+                if spot_bal > s_decimal_zero:
+                    self.logger().warning(
+                        f"[{token}] HEALTH CHECK: State=Opened, no perp, but spot "
+                        f"balance={spot_bal:.6f}. Selling orphaned spot to close exposure."
+                    )
+                    safe_ensure_future(self._force_close_spot_exposure(token, ts, spot_bal))
+                else:
+                    self.logger().warning(
+                        f"[{token}] HEALTH CHECK: State=Opened, no perp, no spot balance. "
+                        f"Resetting to Closed."
+                    )
+                    ts.state = StrategyState.Closed
+                    ts.accumulated_funding = Decimal(0)
+
+            # Scenario 3: stuck in Opening/Closing for too long
+            elif ts.state in (StrategyState.Opening, StrategyState.Closing) and \
+                    ts.execution_started_ts > 0:
+                stuck_seconds = self.current_timestamp - ts.execution_started_ts
+                if stuck_seconds > STUCK_IN_FLIGHT_TIMEOUT:
+                    self.logger().warning(
+                        f"[{token}] HEALTH CHECK: Stuck in {ts.state.name} for "
+                        f"{stuck_seconds:.0f}s (> {STUCK_IN_FLIGHT_TIMEOUT}s). "
+                        f"Force-resetting execution tracker."
+                    )
+                    ts.execution_tracker.clear()
+                    ts.execution_expected_count = 0
+                    if ts.state == StrategyState.Opening:
+                        ts.state = StrategyState.Closed
+                        self.logger().warning(f"[{token}] Force-reset to Closed. Check for orphan positions.")
+                    else:
+                        ts.state = StrategyState.Opened
+                        self.logger().warning(f"[{token}] Force-reset to Opened. Will retry close on next tick.")
+
+    async def _force_close_perp_exposure(self, token: str, ts: TokenState, pos: Position):
+        """Submit a market order to close an orphaned perp position."""
+        is_short = pos.amount < 0
+        close_is_buy = is_short
+        amount = abs(pos.amount)
+
+        self.logger().warning(
+            f"[{token}] Submitting emergency perp close: "
+            f"{'BUY' if close_is_buy else 'SELL'} {amount:.6f} to close orphan position."
+        )
+        fn = self.buy_with_specific_market if close_is_buy else self.sell_with_specific_market
+        fn(
+            ts.perp_tuple,
+            amount,
+            self._perp_market.get_taker_order_type(),
+            position_action=PositionAction.CLOSE,
+        )
+        ts.state = StrategyState.Closed
+        ts.accumulated_funding = Decimal(0)
+
+    async def _force_close_spot_exposure(self, token: str, ts: TokenState, amount: Decimal):
+        """Sell spot to close an orphaned long position."""
+        self.logger().warning(
+            f"[{token}] Submitting emergency spot SELL: {amount:.6f} to close orphan spot."
+        )
+        self.sell_with_specific_market(
+            ts.spot_tuple,
+            amount,
+            self._spot_market.get_taker_order_type(),
+        )
+        ts.state = StrategyState.Closed
+        ts.accumulated_funding = Decimal(0)
+
+    # ------------------------------------------------------------------
+    # Execution: parallel orders + alignment + rollback
+    # ------------------------------------------------------------------
+
+    def _execute_arb_parallel(self, ts: TokenState, proposal: Tuple, purpose: str):
+        spot_is_buy, perp_is_buy, spot_price, perp_price, order_amount = proposal
+        if order_amount == s_decimal_zero:
+            return
+
+        ts.execution_tracker.clear()
+        ts.execution_purpose = purpose
+        ts.execution_expected_count = 2
+        ts.execution_started_ts = self.current_timestamp
+
+        side_s = "BUY" if spot_is_buy else "SELL"
+        self.logger().info(
+            f"[{ts.token}] {side_s} {order_amount:.6f} spot @ {spot_price:.2f}"
+        )
+        spot_fn = self.buy_with_specific_market if spot_is_buy else self.sell_with_specific_market
+        spot_fn(
+            ts.spot_tuple,
+            order_amount,
+            self._spot_market.get_taker_order_type(),
+            spot_price,
+        )
+
+        side_p = "BUY" if perp_is_buy else "SELL"
+        pa = PositionAction.CLOSE if purpose == ExecPurpose.CLOSE else PositionAction.OPEN
+        self.logger().info(
+            f"[{ts.token}] {side_p} {order_amount:.6f} perp @ {perp_price:.2f} ({pa.name})"
+        )
+        perp_fn = self.buy_with_specific_market if perp_is_buy else self.sell_with_specific_market
+        perp_fn(
+            ts.perp_tuple,
+            order_amount,
+            self._perp_market.get_taker_order_type(),
+            perp_price,
+            position_action=pa,
+        )
+
+        if purpose == ExecPurpose.OPEN:
+            ts.state = StrategyState.Opening
+        elif purpose == ExecPurpose.CLOSE:
+            ts.state = StrategyState.Closing
+        # For ADD, keep current state (Opened)
+
+        self.logger().info(
+            f"[{ts.token}] 2 orders placed (purpose={purpose}). "
+            f"Awaiting fills for {order_amount:.6f} {ts.token}."
+        )
+
+    def _record_order_created(self, ts: TokenState, order_id: str, side: str, direction: TradeType):
+        if ts.execution_expected_count == 0:
+            return
+        ts.execution_tracker[order_id] = {
+            "side": side,
+            "direction": direction,
+            "filled_amount": s_decimal_zero,
+            "completed": False,
+        }
+
+    def _record_order_fill(self, ts: TokenState, order_id: str, filled_amount: Decimal):
+        if order_id not in ts.execution_tracker:
+            ts.execution_tracker[order_id] = {
+                "side": "unknown",
+                "direction": None,
+                "filled_amount": s_decimal_zero,
+                "completed": False,
+            }
+        ts.execution_tracker[order_id]["filled_amount"] = filled_amount
+        ts.execution_tracker[order_id]["completed"] = True
+
+        filled_count = sum(1 for v in ts.execution_tracker.values() if v["completed"])
+        if filled_count >= ts.execution_expected_count:
+            self._check_alignment_and_finalize(ts)
+
+    def _handle_order_failure(self, ts: TokenState, order_id: str):
+        if order_id not in ts.execution_tracker:
+            return
+        failed_side = ts.execution_tracker[order_id]["side"]
+        purpose = ts.execution_purpose
+        self.logger().error(f"[{ts.token}] Order {order_id} ({failed_side}) FAILED (purpose={purpose}). Rolling back.")
+
+        for oid, info in ts.execution_tracker.items():
+            if oid != order_id and info["completed"] and info["filled_amount"] > s_decimal_zero:
+                other_side = info["side"]
+                other_amount = info["filled_amount"]
+                other_direction = info["direction"]
+                self.logger().warning(f"[{ts.token}] Rolling back {other_side} — reverse order for {other_amount}.")
+                self._submit_rollback_order(ts, other_side, other_direction, other_amount)
+                break
+
+        ts.execution_tracker.clear()
+        ts.execution_expected_count = 0
+        if purpose == ExecPurpose.OPEN:
+            ts.state = StrategyState.Closed
+            self.logger().info(f"[{ts.token}] Entry rollback. State → Closed.")
+        elif purpose == ExecPurpose.CLOSE:
+            ts.state = StrategyState.Opened
+            self.logger().warning(f"[{ts.token}] Close rollback. State → Opened, will retry.")
+        elif purpose == ExecPurpose.ADD:
+            # Addition failed — just reset, stay Opened
+            self.logger().info(f"[{ts.token}] Addition rollback. State stays Opened.")
+
+    def _check_alignment_and_finalize(self, ts: TokenState):
+        spot_filled = s_decimal_zero
+        perp_filled = s_decimal_zero
+        spot_direction = None
+        perp_direction = None
+
+        for oid, info in ts.execution_tracker.items():
+            if info["side"] == "spot":
+                spot_filled += info["filled_amount"]
+                spot_direction = info["direction"]
+            elif info["side"] == "perp":
+                perp_filled += info["filled_amount"]
+                perp_direction = info["direction"]
+            else:
+                self.logger().warning(f"[{ts.token}] Unknown side '{info['side']}' for order {oid}. Skipping alignment.")
+                ts.execution_tracker.clear()
+                ts.execution_expected_count = 0
+                return
+
+        diff = spot_filled - perp_filled
+        self.logger().info(f"[{ts.token}] Fill check — Spot: {spot_filled:.8f}, Perp: {perp_filled:.8f}, Diff: {diff:.8f}")
+
+        total = max(spot_filled, perp_filled)
+        if diff == s_decimal_zero or (total > s_decimal_zero and abs(diff) / total < Decimal("0.001")):
+            self.logger().info(f"[{ts.token}] Both sides aligned.")
+        else:
+            if diff > 0:
+                catch_amount = diff
+                self.logger().info(f"[{ts.token}] Perp short by {catch_amount:.8f}. Catching up.")
+                self._submit_catch_up_perpetual(ts, perp_direction, catch_amount)
+            else:
+                catch_amount = abs(diff)
+                self.logger().info(f"[{ts.token}] Spot short by {catch_amount:.8f}. Catching up.")
+                self._submit_catch_up_spot(ts, spot_direction, catch_amount)
+
+        # State transition by purpose
+        purpose = ts.execution_purpose
+        if purpose == ExecPurpose.OPEN:
+            ts.state = StrategyState.Opened
+            ts.accumulated_funding = Decimal(0)
+            ts.position_opened_ts = self.current_timestamp
+            fi = self.get_funding_info(ts.perp_trading_pair)
+            if fi is not None:
+                ts.entry_funding_rate = fi.rate * Decimal("100")
+            self.logger().info(f"[{ts.token}] Position OPENED (entry rate: {ts.entry_funding_rate:.4f}%).")
+        elif purpose == ExecPurpose.ADD:
+            self.logger().info(f"[{ts.token}] Position ADDITION confirmed. Still Opened.")
+        elif purpose == ExecPurpose.CLOSE:
+            ts.state = StrategyState.Closed
+            ts.next_arbitrage_opening_ts = self.current_timestamp + self._next_arbitrage_opening_delay
+            ts.last_closed_ts = self.current_timestamp
+            self.logger().info(
+                f"[{ts.token}] Position CLOSED. Funding: {ts.accumulated_funding:.4f}. "
+                f"Next open after {self._next_arbitrage_opening_delay:.0f}s."
+            )
+            ts.accumulated_funding = Decimal(0)
+            ts.entry_funding_rate = Decimal(0)
+
+        ts.execution_tracker.clear()
+        ts.execution_expected_count = 0
+
+    def _submit_catch_up_spot(self, ts: TokenState, direction: TradeType, amount: Decimal):
+        is_buy = direction == TradeType.BUY
+        fn = self.buy_with_specific_market if is_buy else self.sell_with_specific_market
+        fn(ts.spot_tuple, amount, self._spot_market.get_taker_order_type())
+
+    def _submit_catch_up_perpetual(self, ts: TokenState, direction: TradeType, amount: Decimal):
+        is_buy = direction == TradeType.BUY
+        pa = PositionAction.CLOSE if ts.execution_purpose == ExecPurpose.CLOSE else PositionAction.OPEN
+        fn = self.buy_with_specific_market if is_buy else self.sell_with_specific_market
+        fn(ts.perp_tuple, amount, self._perp_market.get_taker_order_type(), position_action=pa)
+
+    def _submit_rollback_order(self, ts: TokenState, side: str, original_direction: TradeType, amount: Decimal):
+        reverse_buy = original_direction != TradeType.BUY
+        if side == "spot":
+            fn = self.buy_with_specific_market if reverse_buy else self.sell_with_specific_market
+            fn(ts.spot_tuple, amount, self._spot_market.get_taker_order_type())
+        else:
+            fn = self.buy_with_specific_market if reverse_buy else self.sell_with_specific_market
+            fn(ts.perp_tuple, amount, self._perp_market.get_taker_order_type(),
+               position_action=PositionAction.CLOSE)
+        self.logger().warning(f"[{ts.token}] Rollback: {side} {'BUY' if reverse_buy else 'SELL'} {amount}.")
+
+    # ------------------------------------------------------------------
+    # Slippage / budget
+    # ------------------------------------------------------------------
+
+    def apply_slippage_buffers(self, proposal: Tuple, ts: TokenState):
+        spot_is_buy, perp_is_buy, spot_price, perp_price, order_amount = proposal
+        spot_buf = self._spot_market_slippage_buffer if spot_is_buy else -self._spot_market_slippage_buffer
+        perp_buf = self._perp_market_slippage_buffer if perp_is_buy else -self._perp_market_slippage_buffer
+        new_spot = spot_price * (Decimal("1") + spot_buf)
+        new_perp = perp_price * (Decimal("1") + perp_buf)
+        new_spot = self._spot_market.quantize_order_price(ts.spot_trading_pair, new_spot)
+        new_perp = self._perp_market.quantize_order_price(ts.perp_trading_pair, new_perp)
+        return (spot_is_buy, perp_is_buy, new_spot, new_perp, order_amount)
+
+    def check_budget_available(self) -> bool:
+        spot_quote = self._spot_market_info.quote_asset
+        perp_quote = self._perp_market_info.quote_asset
+        spot_bal = self._spot_market.get_available_balance(spot_quote)
+        perp_bal = self._perp_market.get_available_balance(perp_quote)
+        if spot_bal == s_decimal_zero:
+            self.logger().info(f"Cannot trade: spot {spot_quote} balance is 0.")
+            return False
+        if perp_bal == s_decimal_zero:
+            self.logger().info(f"Cannot trade: perp {perp_quote} balance is 0.")
+            return False
+        return True
+
+    def check_budget_constraint(self, proposal: Tuple, ts: TokenState, order_amount: Decimal) -> bool:
+        spot_is_buy, perp_is_buy, spot_price, perp_price = proposal[:4]
+        return self._check_spot_budget(ts, spot_is_buy, spot_price, order_amount) and \
+            self._check_perp_budget(ts, perp_is_buy, perp_price, order_amount)
+
+    def _check_spot_budget(self, ts: TokenState, is_buy: bool, price: Decimal, amount: Decimal) -> bool:
+        bc = self._spot_market.budget_checker
+        candidate = OrderCandidate(
+            trading_pair=ts.spot_trading_pair,
+            is_maker=False,
+            order_type=OrderType.LIMIT,
+            order_side=TradeType.BUY if is_buy else TradeType.SELL,
+            amount=amount,
+            price=price,
+        )
+        adj = bc.adjust_candidate(candidate, all_or_none=True)
+        if adj.amount < amount:
+            self.logger().info(f"[{ts.token}] Spot balance insufficient.")
+            return False
+        return True
+
+    def _check_perp_budget(self, ts: TokenState, is_buy: bool, price: Decimal, amount: Decimal) -> bool:
+        bc = self._perp_market.budget_checker
+        pos = self._perp_position_for_token(ts.token)
+        position_close = False
+        if pos and abs(pos.amount) == amount:
+            cur_short = pos.amount < 0
+            cur_buy = not cur_short
+            if is_buy != cur_buy:
+                position_close = True
+
+        candidate = PerpetualOrderCandidate(
+            trading_pair=ts.perp_trading_pair,
+            is_maker=False,
+            order_type=OrderType.LIMIT,
+            order_side=TradeType.BUY if is_buy else TradeType.SELL,
+            amount=amount,
+            price=price,
+            leverage=Decimal(self._perp_leverage),
+            position_close=position_close,
+        )
+        adj = bc.adjust_candidate(candidate, all_or_none=True)
+        if adj.amount < amount:
+            self.logger().info(f"[{ts.token}] Perp balance insufficient.")
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Status display
+    # ------------------------------------------------------------------
+
+    def active_positions_df(self) -> pd.DataFrame:
+        columns = ["Token", "Type", "Entry Price", "Amount", "Leverage", "Unrealized PnL"]
+        data = []
+        for pos in self.perp_positions:
+            token = pos.trading_pair.split("-")[0]
+            data.append([
+                token,
+                "LONG" if pos.amount > 0 else "SHORT",
+                pos.entry_price,
+                pos.amount,
+                pos.leverage,
+                pos.unrealized_pnl,
+            ])
+        return pd.DataFrame(data=data, columns=columns)
+
+    async def format_status(self) -> str:
+        lines = []
+        lines.extend(["", f"  Spot: {self._spot_market.display_name} | "
+                     f"Perp: {self._perp_market.display_name} | "
+                     f"Tokens: {', '.join(self._tokens)}"])
+
+        # Positions
+        positions = self.perp_positions
+        if positions:
+            df = self.active_positions_df()
+            lines.extend(["", "  Positions:"] + ["    " + l for l in df.to_string(index=False).split("\n")])
+        else:
+            lines.extend(["", "  No active positions."])
+
+        # Per-token status
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            fi = self.get_funding_info(ts.perp_trading_pair)
+            fr = f"{fi.rate * 100:.4f}%" if fi else "N/A"
+            mp = f"{fi.mark_price:.2f}" if fi else "N/A"
+
+            alloc = self._calc_dynamic_allocation(token, fi.rate * Decimal("100")) if fi else s_decimal_zero
+            lines.extend(["", f"  ── {token} ──",
+                          f"    State: {ts.state.name} | Funding Rate: {fr} | Mark: {mp} | "
+                          f"Alloc: {alloc:.2f} / {self._total_order_amount_quote:.2f}"])
+
+            if ts.state == StrategyState.Opened:
+                pos = self._perp_position_for_token(token)
+                if pos:
+                    unreal = pos.unrealized_pnl
+                    total = unreal + ts.accumulated_funding
+                    pv = abs(pos.amount) * (fi.mark_price if fi else s_decimal_zero)
+                    pct = total / pv * 100 if pv != s_decimal_zero else s_decimal_zero
+                    held = self.current_timestamp - ts.position_opened_ts
+                    lines.append(f"    Funding: {ts.accumulated_funding:.4f} | Unreal: {unreal:.4f} | "
+                                 f"Total PnL: {total:.4f} ({pct:.4f}%) | Held: {held:.0f}s")
+            elif ts.state == StrategyState.Closed and ts.last_closed_ts > 0:
+                since = self.current_timestamp - ts.last_closed_ts
+                if since < self._reopen_cooldown_seconds:
+                    lines.append(f"    Cooldown: {(self._reopen_cooldown_seconds - since):.0f}s remaining")
+
+        # Strategy params
+        lines.extend([
+            "",
+            f"  Params: Min Funding {self._min_funding_rate_pct:.4f}% | Exit Funding {self._exit_funding_rate_pct:.4f}%",
+            f"          Take Profit {self._take_profit_pct:.2f}% | Stop Loss {self._stop_loss_pct:.2f}%",
+            f"          Total Capital {self._total_order_amount_quote} {self._spot_market_info.quote_asset} | Leverage {self._perp_leverage}x",
+            f"          Max Entry Spread {self._max_entry_spread_pct:.4f}% | Max Exit Spread {self._max_exit_spread_pct:.4f}%",
+            f"          Spread/Funding Ratio {self._max_spread_to_funding_ratio:.1f}",
+            f"          Check Interval {self._check_interval_seconds:.0f}s | Min Holding {self._min_holding_seconds / 3600:.1f}h | Reopen Cooldown {self._reopen_cooldown_seconds / 3600:.1f}h",
+        ])
+
+        assets_df = self.wallet_balance_data_frame([self._spot_market_info, self._perp_market_info])
+        lines.extend(["", "  Assets:"] + ["    " + l for l in str(assets_df).split("\n")])
+
+        wl = self.network_warning([self._spot_market_info]) + self.network_warning([self._perp_market_info])
+        wl += self.balance_warning([self._spot_market_info]) + self.balance_warning([self._perp_market_info])
+        if wl:
+            lines.extend(["", "*** WARNINGS ***"] + wl)
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def tracked_market_orders(self) -> List[Tuple[ConnectorBase, MarketOrder]]:
+        return self._sb_order_tracker.tracked_market_orders
+
+    @property
+    def tracked_limit_orders(self) -> List[Tuple[ConnectorBase, LimitOrder]]:
+        return self._sb_order_tracker.tracked_limit_orders
+
+    def start(self, clock: Clock, timestamp: float):
+        self._ready_to_start = False
+        self.apply_initial_settings()
+
+    def stop(self, clock: Clock):
+        if self._main_task is not None:
+            self._main_task.cancel()
+            self._main_task = None
+        self._ready_to_start = False
+
+    # ------------------------------------------------------------------
+    # Event callbacks
+    # ------------------------------------------------------------------
+
+    def _find_token_by_pair(self, trading_pair: str) -> Optional[str]:
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if trading_pair in (ts.spot_trading_pair, ts.perp_trading_pair):
+                return token
+        return None
+
+    def _find_token_state_by_order(self, order_id: str) -> Optional[TokenState]:
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if order_id in ts.execution_tracker:
+                return ts
+        return None
+
+    def did_create_buy_order(self, event: BuyOrderCreatedEvent):
+        token = self._find_token_by_pair(event.trading_pair)
+        if token is None:
+            return
+        ts = self._ts_for(token)
+        side = "spot" if event.trading_pair == ts.spot_trading_pair else "perp"
+        self._record_order_created(ts, event.order_id, side, TradeType.BUY)
+
+    def did_create_sell_order(self, event: SellOrderCreatedEvent):
+        token = self._find_token_by_pair(event.trading_pair)
+        if token is None:
+            return
+        ts = self._ts_for(token)
+        side = "spot" if event.trading_pair == ts.spot_trading_pair else "perp"
+        self._record_order_created(ts, event.order_id, side, TradeType.SELL)
+
+    def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if event.order_id in ts.execution_tracker:
+                self._record_order_fill(ts, event.order_id, event.base_asset_amount)
+                return
+
+    def did_complete_sell_order(self, event: SellOrderCompletedEvent):
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if event.order_id in ts.execution_tracker:
+                self._record_order_fill(ts, event.order_id, event.base_asset_amount)
+                return
+
+    def did_fail_order(self, event: MarketOrderFailureEvent):
+        ts = self._find_token_state_by_order(event.order_id)
+        if ts is not None:
+            self._handle_order_failure(ts, event.order_id)
+
+    def did_complete_funding_payment(self, event: FundingPaymentCompletedEvent):
+        token = event.trading_pair.split("-")[0]
+        if token not in self._token_states:
+            return
+        ts = self._ts_for(token)
+        if ts.state != StrategyState.Opened:
+            return
+        ts.accumulated_funding += event.amount
+        action = "received" if event.amount > 0 else "paid"
+        self.logger().info(
+            f"[{token}] Funding payment {action}: {abs(event.amount):.4f} "
+            f"(total: {ts.accumulated_funding:.4f})"
+        )
+
+    def did_change_position_mode_succeed(self, event: PositionModeChangeEvent):
+        if event.position_mode is PositionMode.ONEWAY:
+            self.logger().info("Position mode ONEWAY succeeded.")
+            self._position_mode_ready = True
+        else:
+            self.logger().warning("Position mode is not ONEWAY.")
+            self._position_mode_ready = False
+
+    def did_change_position_mode_fail(self, event: PositionModeChangeEvent):
+        self.logger().error(f"Position mode change failed: {event.message}.")
+        self._position_mode_ready = False
