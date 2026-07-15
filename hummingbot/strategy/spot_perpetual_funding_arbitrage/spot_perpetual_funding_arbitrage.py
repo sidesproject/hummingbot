@@ -266,6 +266,28 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
                         locked += abs(pos.amount) * mark
         return locked
 
+    def _can_afford_on_both_sides(self, token: str, order_amount: Decimal) -> bool:
+        """Quick balance check before submitting orders, to avoid noisy failures."""
+        spot_base, spot_quote = self._ts_for(token).spot_trading_pair.split("-")
+        perp_quote = self._ts_for(token).perp_trading_pair.split("-")[1]
+
+        if not self._spot_market.get_available_balance(spot_quote) > s_decimal_zero:
+            return False
+        if not self._perp_market.get_available_balance(perp_quote) > s_decimal_zero:
+            return False
+        # Spot buy: need enough quote to cover order
+        fi = self.get_funding_info(self._ts_for(token).perp_trading_pair)
+        if fi is None:
+            return False
+        est_cost = order_amount * fi.index_price * Decimal("1.01")
+        spot_quote_bal = self._spot_market.get_available_balance(spot_quote)
+        if spot_quote_bal < est_cost:
+            return False
+        perp_quote_bal = self._perp_market.get_available_balance(perp_quote)
+        if perp_quote_bal < est_cost:
+            return False
+        return True
+
     def apply_initial_settings(self):
         for token in self._tokens:
             pair = self._ts_for(token).perp_trading_pair
@@ -326,20 +348,18 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             return
         self._last_check_ts = self.current_timestamp
 
+        # ── Phase 1: collect eligible tokens (pass all entry guards) ──
+        eligible = []
         for token in self._tokens:
             ts = self._ts_for(token)
             if ts.state in (StrategyState.Opening, StrategyState.Closing):
                 continue
-
-            # Don't stack multiple in-flight orders for the same token
             if ts.execution_expected_count > 0:
                 continue
-
             if ts.state == StrategyState.Closed:
                 if ts.next_arbitrage_opening_ts > self.current_timestamp:
                     continue
-                since_close = self.current_timestamp - ts.last_closed_ts
-                if since_close < self._reopen_cooldown_seconds:
+                if self.current_timestamp - ts.last_closed_ts < self._reopen_cooldown_seconds:
                     continue
 
             funding_info = self.get_funding_info(ts.perp_trading_pair)
@@ -352,8 +372,62 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             if current_funding_rate_pct < self._min_funding_rate_pct:
                 continue
 
-            # Dynamic allocation: allocate remaining capital proportional to funding rates
-            alloc_quote = self._calc_dynamic_allocation(token, current_funding_rate_pct)
+            # Phase-1 spread check using index/mark — avoids per-token API call
+            mark_price = funding_info.mark_price
+            idx_price = funding_info.index_price
+            if mark_price is None or idx_price is None or mark_price == s_decimal_zero:
+                continue
+            spread_pct = (idx_price - mark_price) / mark_price * Decimal("100")
+            if spread_pct > self._max_entry_spread_pct:
+                self._log_throttled(token,
+                    f"Entry rejected: spot_buy({price_spot:.2f}) - perp_sell({price_perp:.2f}) "
+                    f"spread ({spread_pct:.4f}%) exceeds max_entry_spread_pct "
+                    f"({self._max_entry_spread_pct:.4f}%).")
+                continue
+            if current_funding_rate_pct > s_decimal_zero:
+                ratio = spread_pct / current_funding_rate_pct
+                if ratio > self._max_spread_to_funding_ratio:
+                    self._log_throttled(token,
+                        f"Entry rejected: spread ({spread_pct:.4f}%) / funding "
+                        f"({current_funding_rate_pct:.4f}%) ratio ({ratio:.1f}) exceeds "
+                        f"max_spread_to_funding_ratio ({self._max_spread_to_funding_ratio:.1f}).")
+                    continue
+
+            eligible.append({
+                "token": token,
+                "ts": ts,
+                "funding_info": funding_info,
+                "funding_rate_pct": current_funding_rate_pct,
+                "is_addition": ts.state == StrategyState.Opened,
+            })
+
+        if not eligible:
+            return
+
+        # ── Phase 2: allocate & execute among eligible pool ──
+        pool_rate = s_decimal_zero
+        for e in eligible:
+            pool_rate += e["funding_rate_pct"]
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if ts.state in (StrategyState.Opened, StrategyState.Opening):
+                pool_rate += ts.entry_funding_rate
+
+        if pool_rate == s_decimal_zero:
+            return
+
+        remaining = self._total_order_amount_quote - self._locked_capital()
+        if remaining <= s_decimal_zero:
+            return
+
+        for e in eligible:
+            token = e["token"]
+            ts = e["ts"]
+            funding_info = e["funding_info"]
+            funding_rate_pct = e["funding_rate_pct"]
+            is_addition = e["is_addition"]
+
+            alloc_quote = remaining * (funding_rate_pct / pool_rate)
             if alloc_quote == s_decimal_zero:
                 continue
 
@@ -361,48 +435,31 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             if order_amount == s_decimal_zero:
                 continue
 
-            perp_is_buy = False
-            spot_is_buy = True
+            if not self._can_afford_on_both_sides(token, order_amount):
+                self._log_throttled(token,
+                    f"Skipping {token}: insufficient balance on one or both sides "
+                    f"for {order_amount:.6f}. Will retry when balance is available.")
+                continue
+
             price_perp, price_spot = await self._get_order_prices(
                 ts.spot_trading_pair, ts.perp_trading_pair,
-                perp_is_buy, spot_is_buy, order_amount,
+                perp_is_buy=False, spot_is_buy=True, order_amount=order_amount,
             )
             if price_perp is None or price_spot is None:
                 continue
 
-            # Entry spread guards
-            if price_perp != s_decimal_zero:
-                spread_pct = (price_spot - price_perp) / price_perp * Decimal("100")
-                if spread_pct > self._max_entry_spread_pct:
-                    self._log_throttled(token,
-                        f"Entry rejected: spot_buy({price_spot:.2f}) - perp_sell({price_perp:.2f}) "
-                        f"spread ({spread_pct:.4f}%) exceeds max_entry_spread_pct "
-                        f"({self._max_entry_spread_pct:.4f}%).")
-                    continue
-                if current_funding_rate_pct > s_decimal_zero:
-                    ratio = spread_pct / current_funding_rate_pct
-                    if ratio > self._max_spread_to_funding_ratio:
-                        self._log_throttled(token,
-                            f"Entry rejected: spread ({spread_pct:.4f}%) / funding "
-                            f"({current_funding_rate_pct:.4f}%) ratio ({ratio:.1f}) exceeds "
-                            f"max_spread_to_funding_ratio ({self._max_spread_to_funding_ratio:.1f}).")
-                        continue
-
-            is_addition = ts.state == StrategyState.Opened
             label = "Adding to" if is_addition else "Opening"
             self.logger().info(
-                f"[{token}] {label} position: rate {current_funding_rate_pct:.4f}%, "
-                f"alloc {alloc_quote:.2f} quote ({order_amount:.6f} {token}), "
-                f"remaining capital ~{self._total_order_amount_quote - self._locked_capital():.2f}."
+                f"[{token}] {label} position: rate {funding_rate_pct:.4f}%, "
+                f"alloc {alloc_quote:.2f} quote ({order_amount:.6f} {token})."
             )
 
-            proposal = (spot_is_buy, perp_is_buy, price_spot, price_perp, order_amount)
+            proposal = (True, False, price_spot, price_perp, order_amount)
             proposal = self.apply_slippage_buffers(proposal, ts)
-            if self.check_budget_constraint(proposal, ts, order_amount):
-                self._execute_arb_parallel(
-                    ts, proposal,
-                    purpose=ExecPurpose.ADD if is_addition else ExecPurpose.OPEN,
-                )
+            self._execute_arb_parallel(
+                ts, proposal,
+                purpose=ExecPurpose.ADD if is_addition else ExecPurpose.OPEN,
+            )
 
     def _log_throttled(self, token: str, msg: str, interval: float = 60):
         last = self._last_log_ts.get(token, 0)
