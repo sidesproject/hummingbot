@@ -294,6 +294,38 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             self._perp_market.set_leverage(pair, self._perp_leverage)
         self._perp_market.set_position_mode(PositionMode.ONEWAY)
 
+    def _resume_existing_positions(self):
+        """Scan exchange positions and restore token states after restart."""
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            pos = self._perp_position_for_token(token)
+            if pos is None or pos.amount == s_decimal_zero:
+                continue
+
+            amount = abs(pos.amount)
+            if pos.amount < 0:
+                # Existing SHORT — this is the expected direction
+                ts.state = StrategyState.Opened
+                ts.position_opened_ts = self.current_timestamp
+                fi = self.get_funding_info(ts.perp_trading_pair)
+                if fi is not None:
+                    ts.entry_funding_rate = fi.rate * Decimal("100")
+                self.logger().info(
+                    f"[{token}] Resumed existing SHORT position: {amount:.6f} "
+                    f"@ {pos.entry_price}. Funding rate: {ts.entry_funding_rate:.4f}%."
+                )
+            else:
+                # Existing LONG — unexpected for this strategy
+                self.logger().warning(
+                    f"[{token}] Found existing LONG position ({amount:.6f}). "
+                    f"This strategy only opens SHORTs. Please manually close this position."
+                )
+
+            self.logger().info(
+                f"[{token}] Spot balance ({token}): "
+                f"{self._spot_market.get_available_balance(token):.6f} available."
+            )
+
     # ------------------------------------------------------------------
     # Tick / Main loop
     # ------------------------------------------------------------------
@@ -319,6 +351,9 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             if not self.check_budget_available():
                 self.logger().info("Trading not possible.")
                 return
+
+            # Resume: scan existing exchange positions and restore token states
+            self._resume_existing_positions()
 
             self._ready_to_start = True
 
