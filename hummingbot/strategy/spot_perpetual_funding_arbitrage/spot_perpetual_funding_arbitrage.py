@@ -500,10 +500,11 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
 
             proposal = (True, False, price_spot, price_perp, order_amount)
             proposal = self.apply_slippage_buffers(proposal, ts)
-            self._execute_arb_parallel(
-                ts, proposal,
-                purpose=ExecPurpose.ADD if is_addition else ExecPurpose.OPEN,
-            )
+            if self.check_budget_constraint(proposal, ts, order_amount):
+                self._execute_arb_parallel(
+                    ts, proposal,
+                    purpose=ExecPurpose.ADD if is_addition else ExecPurpose.OPEN,
+                )
 
     def _log_throttled(self, token: str, msg: str, interval: float = 60):
         last = self._last_log_ts.get(token, 0)
@@ -968,6 +969,13 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
         return True
 
     def _check_perp_budget(self, ts: TokenState, is_buy: bool, price: Decimal, amount: Decimal) -> bool:
+        perp_quote = ts.perp_trading_pair.split("-")[1]
+        perp_bal = self._perp_market.get_available_balance(perp_quote)
+        if perp_bal == s_decimal_zero:
+            # Unified margin: perp wallet is 0, spot covers both sides.
+            # The spot budget check already validated total balance.
+            return True
+
         bc = self._perp_market.budget_checker
         pos = self._perp_position_for_token(ts.token)
         position_close = False
