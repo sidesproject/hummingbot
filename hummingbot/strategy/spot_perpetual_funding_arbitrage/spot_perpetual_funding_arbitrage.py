@@ -445,7 +445,7 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
         position_value = position_amount * funding_info.mark_price
         unrealized = perp_position.unrealized_pnl
         total_pnl = unrealized + ts.accumulated_funding
-        total_pnl_pct = total_pnl / position_value if position_value != s_decimal_zero else s_decimal_zero
+        total_pnl_pct = (total_pnl / position_value * Decimal("100")) if position_value != s_decimal_zero else s_decimal_zero
 
         should_close = False
         is_stop_loss = False
