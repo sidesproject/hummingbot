@@ -267,25 +267,32 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
         return locked
 
     def _can_afford_on_both_sides(self, token: str, order_amount: Decimal) -> bool:
-        """Quick balance check before submitting orders, to avoid noisy failures."""
-        spot_base, spot_quote = self._ts_for(token).spot_trading_pair.split("-")
+        """Quick balance check before submitting orders, to avoid noisy failures.
+
+        In Multi-Assets (unified margin) mode the perp wallet shows 0 — all funds
+        are in spot. The spot position itself serves as collateral for the perp
+        side, so a single est_cost covers both legs.
+        """
+        spot_quote = self._ts_for(token).spot_trading_pair.split("-")[1]
         perp_quote = self._ts_for(token).perp_trading_pair.split("-")[1]
 
-        if not self._spot_market.get_available_balance(spot_quote) > s_decimal_zero:
-            return False
-        if not self._perp_market.get_available_balance(perp_quote) > s_decimal_zero:
-            return False
-        # Spot buy: need enough quote to cover order
+        spot_bal = self._spot_market.get_available_balance(spot_quote)
+        perp_bal = self._perp_market.get_available_balance(perp_quote)
+
         fi = self.get_funding_info(self._ts_for(token).perp_trading_pair)
         if fi is None:
             return False
         est_cost = order_amount * fi.index_price * Decimal("1.01")
-        spot_quote_bal = self._spot_market.get_available_balance(spot_quote)
-        if spot_quote_bal < est_cost:
-            return False
-        perp_quote_bal = self._perp_market.get_available_balance(perp_quote)
-        if perp_quote_bal < est_cost:
-            return False
+
+        if perp_bal == s_decimal_zero:
+            # Unified margin: only spot balance matters, spot position is collateral
+            if spot_bal < est_cost:
+                return False
+        else:
+            if spot_bal < est_cost:
+                return False
+            if perp_bal < est_cost:
+                return False
         return True
 
     def apply_initial_settings(self):
@@ -925,12 +932,16 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
         perp_quote = self._perp_market_info.quote_asset
         spot_bal = self._spot_market.get_available_balance(spot_quote)
         perp_bal = self._perp_market.get_available_balance(perp_quote)
+
+        # Unified margin: perp can be 0 as long as spot has enough
         if spot_bal == s_decimal_zero:
             self.logger().info(f"Cannot trade: spot {spot_quote} balance is 0.")
             return False
         if perp_bal == s_decimal_zero:
-            self.logger().info(f"Cannot trade: perp {perp_quote} balance is 0.")
-            return False
+            self.logger().info(
+                f"Perp {perp_quote} balance is 0 — assuming unified margin mode "
+                f"(all margin drawn from spot)."
+            )
         return True
 
     def check_budget_constraint(self, proposal: Tuple, ts: TokenState, order_amount: Decimal) -> bool:
