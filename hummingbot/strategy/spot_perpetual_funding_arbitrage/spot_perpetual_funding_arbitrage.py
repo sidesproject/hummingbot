@@ -248,12 +248,25 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
 
     def _quote_to_base(self, token: str, quote_amount: Decimal, price: Decimal) -> Decimal:
         raw = quote_amount / price if price != s_decimal_zero else s_decimal_zero
-        # Perp usually has the coarser step size (e.g. BNB step=0.1) —
-        # quantize by perp rules first to get a valid perp amount,
-        # spot precision is finer and will accept it.
         ts = self._ts_for(token)
+
+        # Quantize to perp step size (usually the coarser of the two sides)
         amt = self._perp_market.quantize_order_amount(ts.perp_trading_pair, raw)
-        return max(amt, s_decimal_zero)
+        if amt == s_decimal_zero:
+            return s_decimal_zero
+
+        # Ensure amt satisfies perp min Qty — if raw falls between 0 and minQty,
+        # quantize may floor to 0. In that case, bump to minQty.
+        try:
+            rule = self._perp_market.trading_rules.get(ts.perp_trading_pair)
+            if rule is not None and amt < rule.min_order_size:
+                amt = rule.min_order_size
+        except Exception:
+            pass
+
+        # Also ensure spot quantisation yields the same amount
+        spot_amt = self._spot_market.quantize_order_amount(ts.spot_trading_pair, amt)
+        return max(min(amt, spot_amt), s_decimal_zero)
 
     def _locked_capital(self) -> Decimal:
         locked = s_decimal_zero
