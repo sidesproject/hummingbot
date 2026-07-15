@@ -28,18 +28,21 @@ async def start(self):
 
     total_order_amount_quote = spot_perpetual_funding_arbitrage_config_map.get("total_order_amount_quote").value
     perpetual_leverage = spot_perpetual_funding_arbitrage_config_map.get("perpetual_leverage").value
-    min_funding_rate_pct = spot_perpetual_funding_arbitrage_config_map.get("min_funding_rate_pct").value / Decimal("100")
-    exit_funding_rate_pct = spot_perpetual_funding_arbitrage_config_map.get("exit_funding_rate_pct").value / Decimal("100")
-    take_profit_pct = spot_perpetual_funding_arbitrage_config_map.get("take_profit_pct").value / Decimal("100")
-    stop_loss_pct = spot_perpetual_funding_arbitrage_config_map.get("stop_loss_pct").value / Decimal("100")
+    # Percent params: config values are in "percentage as typed" (e.g. 0.05 = 0.05%).
+    # Strategy code already handles them in percentage form, so pass directly.
+    min_funding_rate_pct = spot_perpetual_funding_arbitrage_config_map.get("min_funding_rate_pct").value
+    exit_funding_rate_pct = spot_perpetual_funding_arbitrage_config_map.get("exit_funding_rate_pct").value
+    take_profit_pct = spot_perpetual_funding_arbitrage_config_map.get("take_profit_pct").value
+    stop_loss_pct = spot_perpetual_funding_arbitrage_config_map.get("stop_loss_pct").value
+    max_entry_spread_pct = spot_perpetual_funding_arbitrage_config_map.get("max_entry_spread_pct").value
+    max_exit_spread_pct = spot_perpetual_funding_arbitrage_config_map.get("max_exit_spread_pct").value
+    # Slippage params: used as multipliers (1 + buffer), so /100 is correct
     spot_slippage = spot_perpetual_funding_arbitrage_config_map.get("spot_market_slippage_buffer").value / Decimal("100")
     perp_slippage = spot_perpetual_funding_arbitrage_config_map.get("perpetual_market_slippage_buffer").value / Decimal("100")
+    max_spread_to_funding_ratio = spot_perpetual_funding_arbitrage_config_map.get("max_spread_to_funding_ratio").value
     next_delay = spot_perpetual_funding_arbitrage_config_map.get("next_arbitrage_opening_delay").value
     min_holding_hours = spot_perpetual_funding_arbitrage_config_map.get("min_holding_hours").value
     reopen_cooldown_hours = spot_perpetual_funding_arbitrage_config_map.get("reopen_cooldown_hours").value
-    max_entry_spread_pct = spot_perpetual_funding_arbitrage_config_map.get("max_entry_spread_pct").value / Decimal("100")
-    max_spread_to_funding_ratio = spot_perpetual_funding_arbitrage_config_map.get("max_spread_to_funding_ratio").value
-    max_exit_spread_pct = spot_perpetual_funding_arbitrage_config_map.get("max_exit_spread_pct").value / Decimal("100")
     check_interval_seconds = spot_perpetual_funding_arbitrage_config_map.get("check_interval_seconds").value
     health_check_interval_seconds = spot_perpetual_funding_arbitrage_config_map.get("health_check_interval_seconds").value
 
