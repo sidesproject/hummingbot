@@ -39,11 +39,9 @@ def _pm_prefix(path_url: str, domain: str) -> str:
 
 
 def public_rest_url(path_url: str, domain: str = "binance_perpetual"):
-    if _is_pm_domain(domain):
-        base_url = CONSTANTS.PM_BASE_URL
-    else:
-        base_url = CONSTANTS.PERPETUAL_BASE_URL if domain == "binance_perpetual" else CONSTANTS.TESTNET_BASE_URL
-    return base_url + _pm_prefix(path_url, domain)
+    # Market data always from fapi, even for PM domain
+    base_url = CONSTANTS.PERPETUAL_BASE_URL if domain != CONSTANTS.TESTNET_DOMAIN else CONSTANTS.TESTNET_BASE_URL
+    return base_url + path_url
 
 
 def private_rest_url(path_url: str, domain: str = "binance_perpetual"):
