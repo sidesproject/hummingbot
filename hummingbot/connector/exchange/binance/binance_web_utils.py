@@ -5,7 +5,8 @@ from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.connector.utils import TimeSynchronizerRESTPreProcessor
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.web_assistant.auth import AuthBase
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
+from hummingbot.core.web_assistant.rest_pre_processors import RESTPreProcessorBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -44,6 +45,18 @@ def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> s
     return CONSTANTS.REST_URL.format(domain) + CONSTANTS.PRIVATE_API_VERSION + path_url
 
 
+class BinanceRESTPreProcessor(RESTPreProcessorBase):
+    """Sets Content-Type per HTTP method for proper signing."""
+
+    async def pre_process(self, request: RESTRequest) -> RESTRequest:
+        if request.headers is None:
+            request.headers = {}
+        request.headers["Content-Type"] = (
+            "application/json" if request.method == RESTMethod.POST else "application/x-www-form-urlencoded"
+        )
+        return request
+
+
 def build_api_factory(
         throttler: Optional[AsyncThrottler] = None,
         time_synchronizer: Optional[TimeSynchronizer] = None,
@@ -56,12 +69,16 @@ def build_api_factory(
         throttler=throttler,
         domain=domain,
     ))
+    pre_processors = [
+        TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
+    ]
+    if _is_cross_margin(domain):
+        pre_processors.append(BinanceRESTPreProcessor())
     api_factory = WebAssistantsFactory(
         throttler=throttler,
         auth=auth,
-        rest_pre_processors=[
-            TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
-        ])
+        rest_pre_processors=pre_processors,
+    )
     return api_factory
 
 
