@@ -22,8 +22,11 @@ class BinanceAuth(AuthBase):
         the required parameter in the request header.
         :param request: the request to be configured for authenticated interaction
         """
+        is_json = (request.headers or {}).get("Content-Type") == "application/json"
         if request.method == RESTMethod.POST:
             request.data = self.add_auth_to_params(params=json.loads(request.data))
+            if is_json:
+                request.data = json.dumps(request.data)
         else:
             request.params = self.add_auth_to_params(params=request.params)
 
