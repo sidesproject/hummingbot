@@ -517,7 +517,8 @@ class BinanceExchange(ExchangePyBase):
         path_url = "/balance" if is_cross_margin else CONSTANTS.ACCOUNTS_PATH_URL
         account_info = await self._api_get(
             path_url=path_url,
-            is_auth_required=True)
+            is_auth_required=True,
+            limit_id=CONSTANTS.ACCOUNTS_PATH_URL)
 
         if is_cross_margin:
             # Unified Account: plain array of assets
