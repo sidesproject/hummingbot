@@ -1,4 +1,3 @@
-import ujson
 from typing import Any, Callable, Dict, Optional
 
 import hummingbot.connector.derivative.binance_perpetual.binance_perpetual_constants as CONSTANTS
@@ -12,16 +11,13 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 
 class BinancePerpetualRESTPreProcessor(RESTPreProcessorBase):
+    """Override framework default: papi um/order requires form-encoded, not JSON."""
 
     async def pre_process(self, request: RESTRequest) -> RESTRequest:
-        if request.headers is None:
-            request.headers = {}
-        is_json = request.method == RESTMethod.POST
-        request.headers["Content-Type"] = (
-            "application/json" if is_json else "application/x-www-form-urlencoded"
-        )
-        if is_json and isinstance(request.data, dict):
-            request.data = ujson.dumps(request.data)
+        if request.method == RESTMethod.POST:
+            if request.headers is None:
+                request.headers = {}
+            request.headers["Content-Type"] = "application/x-www-form-urlencoded"
         return request
 
 

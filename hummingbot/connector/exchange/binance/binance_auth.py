@@ -22,14 +22,6 @@ class BinanceAuth(AuthBase):
         the required parameter in the request header.
         :param request: the request to be configured for authenticated interaction
         """
-        import logging
-        _log = logging.getLogger(__name__)
-
-        _log.warning(f"[AUTH DEBUG] method={request.method}, url={request.url[:80]}, "
-                     f"data_type={type(request.data).__name__}, "
-                     f"data_len={len(str(request.data))}, "
-                     f"data_preview={str(request.data)[:400]}")
-
         is_json = (request.headers or {}).get("Content-Type") == "application/json"
         if request.method == RESTMethod.POST:
             params = request.data
@@ -37,9 +29,8 @@ class BinanceAuth(AuthBase):
                 params = json.loads(params)
             if isinstance(params, str):
                 params = json.loads(params)
-            request.data = self.add_auth_to_params(params=params)
-            if is_json:
-                request.data = json.dumps(request.data)
+            params = self.add_auth_to_params(params=params)
+            request.data = json.dumps(params) if is_json else params
         else:
             request.params = self.add_auth_to_params(params=request.params)
 
@@ -49,8 +40,6 @@ class BinanceAuth(AuthBase):
         headers.update(self.header_for_authentication())
         request.headers = headers
 
-        _log.warning(f"[AUTH DEBUG] AFTER: data_type={type(request.data).__name__}, "
-                     f"data_preview={str(request.data)[:400]}")
         return request
 
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:

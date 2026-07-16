@@ -1,4 +1,3 @@
-import json
 from typing import Callable, Optional
 
 import hummingbot.connector.exchange.binance.binance_constants as CONSTANTS
@@ -47,21 +46,13 @@ def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> s
 
 
 class BinanceRESTPreProcessor(RESTPreProcessorBase):
-    """Sets Content-Type header for papi compatibility."""
+    """Override framework default: papi margin/order requires form-encoded, not JSON."""
 
     async def pre_process(self, request: RESTRequest) -> RESTRequest:
-        if request.headers is None:
-            request.headers = {}
-        is_json = request.method == RESTMethod.POST
-        request.headers["Content-Type"] = (
-            "application/json" if is_json else "application/x-www-form-urlencoded"
-        )
-        import logging
-        _log = logging.getLogger(__name__)
-        _log.warning(f"[PRE DEBUG] method={request.method}, url={str(request.url)[:80]}, "
-                     f"data_type={type(request.data).__name__}, "
-                     f"data_len={len(str(request.data))}, "
-                     f"data_preview={str(request.data)[:400]}")
+        if request.method == RESTMethod.POST:
+            if request.headers is None:
+                request.headers = {}
+            request.headers["Content-Type"] = "application/x-www-form-urlencoded"
         return request
 
 
