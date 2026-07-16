@@ -272,7 +272,7 @@ class BinancePerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         data = await self._connector._api_get(
             path_url=CONSTANTS.MARK_PRICE_URL,
             params={"symbol": ex_trading_pair},
-            is_auth_required=True)
+            is_auth_required=False)
         return data
 
     async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
