@@ -21,7 +21,7 @@ def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> st
     :return: the full URL to the endpoint
     """
     # Public endpoints always use api.binance.com even for cross margin
-    actual_domain = "com" if _is_cross_margin(domain) else domain
+    actual_domain = "com"
     return CONSTANTS.REST_URL.format(actual_domain) + CONSTANTS.PUBLIC_API_VERSION + path_url
 
 

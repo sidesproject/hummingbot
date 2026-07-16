@@ -149,6 +149,20 @@ class BinanceExchange(ExchangePyBase):
             api_factory=self._web_assistants_factory)
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+        if self._domain == CONSTANTS.CROSS_MARGIN_DOMAIN:
+            from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_user_stream_data_source import (
+                BinancePerpetualUserStreamDataSource,
+            )
+            from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_auth import (
+                BinancePerpetualAuth,
+            )
+            pm_auth = BinancePerpetualAuth(self.api_key, self.secret_key, self._time_synchronizer)
+            return BinancePerpetualUserStreamDataSource(
+                auth=pm_auth,
+                connector=self,
+                api_factory=self._web_assistants_factory,
+                domain=CONSTANTS.PM_DOMAIN,
+            )
         return BinanceAPIUserStreamDataSource(
             auth=self._auth,
             trading_pairs=self._trading_pairs,

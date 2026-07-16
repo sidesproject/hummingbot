@@ -180,7 +180,11 @@ class BinancePerpetualUserStreamDataSource(UserStreamTrackerDataSource):
 
         # Get a websocket assistant and connect it
         ws = await self._get_ws_assistant()
-        url = f"{web_utils.wss_url(CONSTANTS.PRIVATE_WS_ENDPOINT, self._domain)}?listenKey={self._current_listen_key}"
+        if self._domain == CONSTANTS.PM_DOMAIN:
+            # Unified Account: wss://fstream.binance.com/pm/ws/<listenKey>
+            url = f"{CONSTANTS.PM_WS_URL}{CONSTANTS.PM_PRIVATE_WS_PATH}/{self._current_listen_key}"
+        else:
+            url = f"{web_utils.wss_url(CONSTANTS.PRIVATE_WS_ENDPOINT, self._domain)}?listenKey={self._current_listen_key}"
 
         self.logger().info(f"Connecting to user stream with listen key {self._current_listen_key}")
         await ws.connect(ws_url=url, ping_timeout=self.HEARTBEAT_TIME_INTERVAL)

@@ -34,7 +34,9 @@ class BinanceAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws = await self._get_ws_assistant()
-        url = CONSTANTS.WSS_API_URL.format(self._domain)
+        # Map sub-domain connectors to "com" for WS URL
+        ws_domain = "com" if self._domain == CONSTANTS.CROSS_MARGIN_DOMAIN else self._domain
+        url = CONSTANTS.WSS_API_URL.format(ws_domain)
         await ws.connect(ws_url=url, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
         return ws
 

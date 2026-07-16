@@ -15,8 +15,8 @@ PM_BASE_URL = "https://papi.binance.com/papi/"
 
 PERPETUAL_WS_URL = "wss://fstream.binance.com/"
 TESTNET_WS_URL = "wss://stream.binancefuture.com/"
-# PM market data WS still uses fstream; user data WS also fstream
 PM_WS_URL = "wss://fstream.binance.com/"
+PM_PRIVATE_WS_PATH = "pm/ws"  # Unified Account user data stream
 
 PUBLIC_WS_ENDPOINT = "public/stream"   # For @depth (combined stream, wrapped {stream,data} messages)
 MARKET_WS_ENDPOINT = "market/stream"   # For @aggTrade, @markPrice (combined stream)
