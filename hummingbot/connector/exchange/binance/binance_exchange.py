@@ -516,11 +516,20 @@ class BinanceExchange(ExchangePyBase):
             path_url=CONSTANTS.ACCOUNTS_PATH_URL,
             is_auth_required=True)
 
-        balances = account_info["balances"]
+        # Cross Margin returns "userAssets", Spot returns "balances"
+        if "userAssets" in account_info:
+            balances = account_info["userAssets"]
+        else:
+            balances = account_info["balances"]
+
         for balance_entry in balances:
             asset_name = balance_entry["asset"]
             free_balance = Decimal(balance_entry["free"])
-            total_balance = Decimal(balance_entry["free"]) + Decimal(balance_entry["locked"])
+            total_balance = free_balance + Decimal(balance_entry.get("locked", "0"))
+            # Cross margin also tracks borrowed amounts
+            if "borrowed" in balance_entry:
+                total_balance = Decimal(balance_entry.get("netAsset", str(total_balance)))
+
             self._account_available_balances[asset_name] = free_balance
             self._account_balances[asset_name] = total_balance
             remote_asset_names.add(asset_name)
