@@ -180,6 +180,7 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
         self._post_ready_warmup_ticks = 0
         self._last_check_ts: float = 0
         self._last_health_check_ts: float = 0
+        self._first_seen_one_sided: Dict[str, float] = {}  # token → first detection time
         self._last_log_ts: Dict[str, float] = {}
         self._position_mode_ready = False
         self._position_mode_not_ready_counter = 0
@@ -684,74 +685,100 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
     # Health check — detect & fix one-sided exposures
     # ------------------------------------------------------------------
 
-    def _health_check(self):
-        """Periodic safety scan to detect and fix orphaned one-sided positions.
+    _HEALTH_GRACE_SECONDS = 60  # ignore transient one-sidedness during opening/closing
 
-        Scenarios detected:
-          1. State=Closed but perp position exists → orphaned short, force buy-back
-          2. State=Opened but no perp position → orphaned spot, force sell
-          3. State stuck in Opening/Closing for > STUCK_IN_FLIGHT_TIMEOUT → force-reset
+    def _health_check(self):
+        """Position-based safety scan. Ignores strategy state — only looks at
+        actual exchange positions. One-sided exposures must persist for at least
+        _HEALTH_GRACE_SECONDS before being force-closed, to avoid interfering
+        with normal opening/closing alignment.
         """
+        now = self.current_timestamp
         for token in self._tokens:
             ts = self._ts_for(token)
             pos = self._perp_position_for_token(token)
             has_perp = pos is not None and pos.amount != s_decimal_zero
+            perp_amount = abs(pos.amount) if has_perp else s_decimal_zero
+            spot_bal = self._spot_market.get_available_balance(token)
+            has_spot = spot_bal > s_decimal_zero
 
-            # Scenario 1a: State=Closed but perp position exists → orphan short
-            if ts.state == StrategyState.Closed and has_perp:
+            # Balanced: both sides match within min_order_size tolerance
+            diff = spot_bal - perp_amount
+            spot_min = s_decimal_zero
+            try:
+                rule = self._spot_market.trading_rules.get(ts.spot_trading_pair)
+                if rule is not None:
+                    spot_min = rule.min_order_size
+            except Exception:
+                pass
+            if spot_min == s_decimal_zero:
+                spot_min = self._spot_market.quantize_order_amount(ts.spot_trading_pair, Decimal("0.00000001"))
+                if spot_min == s_decimal_zero:
+                    spot_min = Decimal("0.00000001")
+
+            if abs(diff) < spot_min:
+                self._first_seen_one_sided.pop(token, None)
+                continue
+
+            # One-sided or mismatched: track when first detected
+            key = token
+            if key not in self._first_seen_one_sided:
+                self._first_seen_one_sided[key] = now
+                side = "PERP-ONLY" if has_perp and not has_spot else \
+                       "SPOT-ONLY" if has_spot and not has_perp else \
+                       "MISMATCH"
+                self.logger().info(
+                    f"[{token}] HEALTH CHECK: unbalanced ({side}), "
+                    f"spot={spot_bal:.6f}, perp={perp_amount:.6f}, diff={diff:.6f}. "
+                    f"Will force-close if not resolved in {self._HEALTH_GRACE_SECONDS}s."
+                )
+                continue
+
+            elapsed = now - self._first_seen_one_sided[key]
+            if elapsed < self._HEALTH_GRACE_SECONDS:
+                continue
+
+            # Grace expired — force-close
+            if has_perp and not has_spot:
                 self.logger().warning(
-                    f"[{token}] HEALTH CHECK: State=Closed but perp position exists "
-                    f"({pos.amount:.6f}, side={pos.position_side.name}). "
-                    f"Force-closing perp side to eliminate exposure."
+                    f"[{token}] HEALTH CHECK: perp position ({pos.amount:.6f}) with no spot "
+                    f"for {elapsed:.0f}s — force-closing perp."
                 )
                 safe_ensure_future(self._force_close_perp_exposure(token, ts, pos))
-
-            # Scenario 1b: State=Opened + perp exists + no spot balance → naked short
-            elif ts.state == StrategyState.Opened and has_perp:
-                spot_bal = self._spot_market.get_available_balance(token)
-                if spot_bal == s_decimal_zero:
+            elif has_spot and not has_perp:
+                self.logger().warning(
+                    f"[{token}] HEALTH CHECK: spot balance ({spot_bal:.6f}) with no perp "
+                    f"for {elapsed:.0f}s — force-selling spot."
+                )
+                safe_ensure_future(self._force_close_spot_exposure(token, ts, spot_bal))
+            elif has_spot and has_perp and abs(diff) >= spot_min:
+                # Both sides exist but amounts don't match
+                if diff > 0:
+                    # Spot > Perp: sell excess spot
+                    excess = diff
                     self.logger().warning(
-                        f"[{token}] HEALTH CHECK: State=Opened, perp SHORT exists "
-                        f"({pos.amount:.6f}), but spot {token} balance is 0. "
-                        f"Hedge broken — force-closing perp to eliminate naked short."
+                        f"[{token}] HEALTH CHECK: spot > perp by {excess:.6f} "
+                        f"for {elapsed:.0f}s — selling excess spot."
                     )
-                    safe_ensure_future(self._force_close_perp_exposure(token, ts, pos))
-
-            # Scenario 2: state says Opened but no perp position → orphaned spot
-            elif ts.state == StrategyState.Opened and not has_perp:
-                spot_bal = self._spot_market.get_available_balance(token)
-                if spot_bal > s_decimal_zero:
-                    self.logger().warning(
-                        f"[{token}] HEALTH CHECK: State=Opened, no perp, but spot "
-                        f"balance={spot_bal:.6f}. Selling orphaned spot to close exposure."
-                    )
-                    safe_ensure_future(self._force_close_spot_exposure(token, ts, spot_bal))
+                    safe_ensure_future(self._force_close_spot_exposure(token, ts, excess))
                 else:
+                    # Perp > Spot: close excess perp
+                    excess = abs(diff)
                     self.logger().warning(
-                        f"[{token}] HEALTH CHECK: State=Opened, no perp, no spot balance. "
-                        f"Resetting to Closed."
+                        f"[{token}] HEALTH CHECK: perp > spot by {excess:.6f} "
+                        f"for {elapsed:.0f}s — closing excess perp."
                     )
-                    ts.state = StrategyState.Closed
-                    ts.accumulated_funding = Decimal(0)
+                    # Partially close perp (sell excess amount)
+                    side_text = "BUY" if pos.amount < 0 else "SELL"
+                    pa = PositionAction.CLOSE
+                    fn = self.buy_with_specific_market if pos.amount < 0 else self.sell_with_specific_market
+                    self.logger().warning(
+                        f"[{token}] Submitting emergency perp partial close: {side_text} {excess:.6f}."
+                    )
+                    fn(ts.perp_tuple, excess, self._perp_market.get_taker_order_type(),
+                       position_action=pa)
 
-            # Scenario 3: stuck in Opening/Closing for too long
-            elif ts.state in (StrategyState.Opening, StrategyState.Closing) and \
-                    ts.execution_started_ts > 0:
-                stuck_seconds = self.current_timestamp - ts.execution_started_ts
-                if stuck_seconds > STUCK_IN_FLIGHT_TIMEOUT:
-                    self.logger().warning(
-                        f"[{token}] HEALTH CHECK: Stuck in {ts.state.name} for "
-                        f"{stuck_seconds:.0f}s (> {STUCK_IN_FLIGHT_TIMEOUT}s). "
-                        f"Force-resetting execution tracker."
-                    )
-                    ts.execution_tracker.clear()
-                    ts.execution_expected_count = 0
-                    if ts.state == StrategyState.Opening:
-                        ts.state = StrategyState.Closed
-                        self.logger().warning(f"[{token}] Force-reset to Closed. Check for orphan positions.")
-                    else:
-                        ts.state = StrategyState.Opened
-                        self.logger().warning(f"[{token}] Force-reset to Opened. Will retry close on next tick.")
+            del self._first_seen_one_sided[key]
 
     async def _force_close_perp_exposure(self, token: str, ts: TokenState, pos: Position):
         """Submit a market order to close an orphaned perp position."""
@@ -912,18 +939,34 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
         diff = spot_filled - perp_filled
         self.logger().info(f"[{ts.token}] Fill check — Spot: {spot_filled:.8f}, Perp: {perp_filled:.8f}, Diff: {diff:.8f}")
 
-        total = max(spot_filled, perp_filled)
-        if diff == s_decimal_zero or (total > s_decimal_zero and abs(diff) / total < Decimal("0.001")):
-            self.logger().info(f"[{ts.token}] Both sides aligned.")
+        # If diff is smaller than spot min order size, accept as aligned —
+        # a catch-up order would be rejected by the exchange anyway.
+        spot_min = self._spot_market.quantize_order_amount(ts.spot_trading_pair, s_decimal_zero)
+        if spot_min == s_decimal_zero:
+            try:
+                rule = self._spot_market.trading_rules.get(ts.spot_trading_pair)
+                if rule is not None:
+                    spot_min = rule.min_order_size
+            except Exception:
+                pass
+        if spot_min == s_decimal_zero:
+            spot_min = Decimal("0.00000001")
+
+        abs_diff = abs(diff)
+        if abs_diff == s_decimal_zero:
+            self.logger().info(f"[{ts.token}] Both sides exactly aligned.")
+        elif abs_diff < spot_min:
+            self.logger().info(
+                f"[{ts.token}] Diff ({abs_diff:.8f}) < min order size ({spot_min:.8f}) "
+                f"— treating as aligned."
+            )
         else:
             if diff > 0:
-                catch_amount = diff
-                self.logger().info(f"[{ts.token}] Perp short by {catch_amount:.8f}. Catching up.")
-                self._submit_catch_up_perpetual(ts, perp_direction, catch_amount)
+                self.logger().info(f"[{ts.token}] Perp short by {abs_diff:.8f}. Catching up.")
+                self._submit_catch_up_perpetual(ts, perp_direction, abs_diff)
             else:
-                catch_amount = abs(diff)
-                self.logger().info(f"[{ts.token}] Spot short by {catch_amount:.8f}. Catching up.")
-                self._submit_catch_up_spot(ts, spot_direction, catch_amount)
+                self.logger().info(f"[{ts.token}] Spot short by {abs_diff:.8f}. Catching up.")
+                self._submit_catch_up_spot(ts, spot_direction, abs_diff)
 
         self._finalize_state(ts)
 
