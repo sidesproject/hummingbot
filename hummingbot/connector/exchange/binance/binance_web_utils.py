@@ -47,13 +47,7 @@ def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> s
 
 
 class BinanceRESTPreProcessor(RESTPreProcessorBase):
-    """Sets Content-Type and undoes RESTRequest._ensure_data double-encoding.
-
-    The framework's RESTRequest._ensure_data calls ujson.dumps on POST data,
-    but rest_assistant already serializes before constructing the request,
-    resulting in double-encoding (a JSON-encoded JSON string). We decode
-    once here to restore the original JSON string so auth can parse it.
-    """
+    """Sets Content-Type header for papi compatibility."""
 
     async def pre_process(self, request: RESTRequest) -> RESTRequest:
         if request.headers is None:
@@ -62,9 +56,6 @@ class BinanceRESTPreProcessor(RESTPreProcessorBase):
         request.headers["Content-Type"] = (
             "application/json" if is_json else "application/x-www-form-urlencoded"
         )
-        if is_json and isinstance(request.data, str):
-            # Undo double-encoding: '"{\\"key\\":...}"' → '{"key":...}'
-            request.data = json.loads(request.data)
         return request
 
 

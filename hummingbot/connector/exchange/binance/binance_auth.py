@@ -24,7 +24,15 @@ class BinanceAuth(AuthBase):
         """
         is_json = (request.headers or {}).get("Content-Type") == "application/json"
         if request.method == RESTMethod.POST:
-            request.data = self.add_auth_to_params(params=json.loads(request.data))
+            params = request.data
+            # Unwrap: rest_assistant json.dumps + RESTRequest._ensure_data can
+            # double-encode, leaving data as a JSON-encoded JSON string.
+            # Also handle the case where a pre_processor already decoded to dict.
+            if isinstance(params, str):
+                params = json.loads(params)
+            if isinstance(params, str):
+                params = json.loads(params)
+            request.data = self.add_auth_to_params(params=params)
             if is_json:
                 request.data = json.dumps(request.data)
         else:
