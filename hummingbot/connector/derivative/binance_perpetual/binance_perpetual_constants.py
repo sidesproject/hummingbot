@@ -7,12 +7,16 @@ MAX_ORDER_ID_LEN = 32
 
 DOMAIN = EXCHANGE_NAME
 TESTNET_DOMAIN = "binance_perpetual_testnet"
+PM_DOMAIN = "binance_perpetual_pm"
 
 PERPETUAL_BASE_URL = "https://fapi.binance.com/fapi/"
 TESTNET_BASE_URL = "https://testnet.binancefuture.com/fapi/"
+PM_BASE_URL = "https://papi.binance.com/papi/"
 
 PERPETUAL_WS_URL = "wss://fstream.binance.com/"
 TESTNET_WS_URL = "wss://stream.binancefuture.com/"
+# PM market data WS still uses fstream; user data WS also fstream
+PM_WS_URL = "wss://fstream.binance.com/"
 
 PUBLIC_WS_ENDPOINT = "public/stream"   # For @depth (combined stream, wrapped {stream,data} messages)
 MARKET_WS_ENDPOINT = "market/stream"   # For @aggTrade, @markPrice (combined stream)

@@ -2,6 +2,7 @@ from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, Rate
 from hummingbot.core.data_type.in_flight_order import OrderState
 
 DEFAULT_DOMAIN = "com"
+CROSS_MARGIN_DOMAIN = "binance_cross_margin"
 
 HBOT_ORDER_ID_PREFIX = "x-MG43PCSN"
 MAX_ORDER_ID_LEN = 32
@@ -10,6 +11,9 @@ MAX_ORDER_ID_LEN = 32
 REST_URL = "https://api.binance.{}/api/"
 WSS_URL = "wss://stream.binance.{}:9443/ws"
 WSS_API_URL = "wss://ws-api.binance.{}:443/ws-api/v3"
+
+# Cross Margin base URL (for Unified Account — sapi endpoints)
+CROSS_MARGIN_REST_URL = "https://sapi.binance.com/sapi/v1/margin/"
 
 PUBLIC_API_VERSION = "v3"
 PRIVATE_API_VERSION = "v3"

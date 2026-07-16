@@ -21,18 +21,45 @@ class BinancePerpetualRESTPreProcessor(RESTPreProcessorBase):
         return request
 
 
+def _is_pm_domain(domain: str) -> bool:
+    return domain == CONSTANTS.PM_DOMAIN
+
+
+def _pm_prefix(path_url: str, domain: str) -> str:
+    """For PM domain, prefix UM-specific private endpoints with 'um/'."""
+    if not _is_pm_domain(domain):
+        return path_url
+    # Public endpoints that don't need um/ prefix
+    no_prefix = {"v1/ping", "v1/time", "v1/premiumIndex", "v1/listenKey",
+                 "v1/depth", "v1/ticker/bookTicker", "v1/ticker/24hr", "v1/trades"}
+    if path_url in no_prefix:
+        return path_url
+    return f"v1/um/{path_url.split('/', 1)[1]}" if '/' in path_url else f"v1/um/{path_url}"
+
+
 def public_rest_url(path_url: str, domain: str = "binance_perpetual"):
-    base_url = CONSTANTS.PERPETUAL_BASE_URL if domain == "binance_perpetual" else CONSTANTS.TESTNET_BASE_URL
-    return base_url + path_url
+    if _is_pm_domain(domain):
+        base_url = CONSTANTS.PM_BASE_URL
+    else:
+        base_url = CONSTANTS.PERPETUAL_BASE_URL if domain == "binance_perpetual" else CONSTANTS.TESTNET_BASE_URL
+    return base_url + _pm_prefix(path_url, domain)
 
 
 def private_rest_url(path_url: str, domain: str = "binance_perpetual"):
-    base_url = CONSTANTS.PERPETUAL_BASE_URL if domain == "binance_perpetual" else CONSTANTS.TESTNET_BASE_URL
-    return base_url + path_url
+    if _is_pm_domain(domain):
+        base_url = CONSTANTS.PM_BASE_URL
+    else:
+        base_url = CONSTANTS.PERPETUAL_BASE_URL if domain == "binance_perpetual" else CONSTANTS.TESTNET_BASE_URL
+    return base_url + _pm_prefix(path_url, domain)
 
 
 def wss_url(endpoint: str, domain: str = "binance_perpetual"):
-    base_ws_url = CONSTANTS.PERPETUAL_WS_URL if domain == "binance_perpetual" else CONSTANTS.TESTNET_WS_URL
+    if _is_pm_domain(domain):
+        base_ws_url = CONSTANTS.PM_WS_URL
+    elif domain == "binance_perpetual":
+        base_ws_url = CONSTANTS.PERPETUAL_WS_URL
+    else:
+        base_ws_url = CONSTANTS.TESTNET_WS_URL
     return base_ws_url + endpoint
 
 

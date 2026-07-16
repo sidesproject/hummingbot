@@ -36,10 +36,19 @@ class BinancePerpetualConfigMap(BaseConnectorConfigMap):
 
 KEYS = BinancePerpetualConfigMap.model_construct()
 
-OTHER_DOMAINS = ["binance_perpetual_testnet"]
-OTHER_DOMAINS_PARAMETER = {"binance_perpetual_testnet": "binance_perpetual_testnet"}
-OTHER_DOMAINS_EXAMPLE_PAIR = {"binance_perpetual_testnet": "BTC-USDT"}
-OTHER_DOMAINS_DEFAULT_FEES = {"binance_perpetual_testnet": [0.02, 0.04]}
+OTHER_DOMAINS = ["binance_perpetual_testnet", "binance_perpetual_pm"]
+OTHER_DOMAINS_PARAMETER = {
+    "binance_perpetual_testnet": "binance_perpetual_testnet",
+    "binance_perpetual_pm": "binance_perpetual_pm",
+}
+OTHER_DOMAINS_EXAMPLE_PAIR = {
+    "binance_perpetual_testnet": "BTC-USDT",
+    "binance_perpetual_pm": "BTC-USDT",
+}
+OTHER_DOMAINS_DEFAULT_FEES = {
+    "binance_perpetual_testnet": [0.02, 0.04],
+    "binance_perpetual_pm": [0.02, 0.04],
+}
 
 
 class BinancePerpetualTestnetConfigMap(BaseConnectorConfigMap):
@@ -59,4 +68,24 @@ class BinancePerpetualTestnetConfigMap(BaseConnectorConfigMap):
     model_config = ConfigDict(title="binance_perpetual")
 
 
-OTHER_DOMAINS_KEYS = {"binance_perpetual_testnet": BinancePerpetualTestnetConfigMap.model_construct()}
+class BinancePerpetualPMConfigMap(BaseConnectorConfigMap):
+    connector: str = "binance_perpetual_pm"
+    binance_perpetual_pm_api_key: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your Binance Portfolio Margin API key",
+            "is_secure": True, "is_connect_key": True, "prompt_on_new": True}
+    )
+    binance_perpetual_pm_api_secret: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your Binance Portfolio Margin API secret",
+            "is_secure": True, "is_connect_key": True, "prompt_on_new": True}
+    )
+    model_config = ConfigDict(title="binance_perpetual")
+
+
+OTHER_DOMAINS_KEYS = {
+    "binance_perpetual_testnet": BinancePerpetualTestnetConfigMap.model_construct(),
+    "binance_perpetual_pm": BinancePerpetualPMConfigMap.model_construct(),
+}

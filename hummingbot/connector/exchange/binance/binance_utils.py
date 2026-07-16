@@ -62,3 +62,28 @@ class BinanceConfigMap(BaseConnectorConfigMap):
 
 
 KEYS = BinanceConfigMap.model_construct()
+
+OTHER_DOMAINS = ["binance_cross_margin"]
+OTHER_DOMAINS_PARAMETER = {"binance_cross_margin": "binance_cross_margin"}
+OTHER_DOMAINS_EXAMPLE_PAIR = {"binance_cross_margin": "BTC-USDT"}
+OTHER_DOMAINS_DEFAULT_FEES = {"binance_cross_margin": [0.1, 0.1]}
+
+
+class BinanceCrossMarginConfigMap(BaseConnectorConfigMap):
+    connector: str = "binance_cross_margin"
+    binance_cross_margin_api_key: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your Binance Unified Account API key (same key as binance_perpetual_pm)",
+            "is_secure": True, "is_connect_key": True, "prompt_on_new": True}
+    )
+    binance_cross_margin_api_secret: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your Binance Unified Account API secret",
+            "is_secure": True, "is_connect_key": True, "prompt_on_new": True}
+    )
+    model_config = ConfigDict(title="binance")
+
+
+OTHER_DOMAINS_KEYS = {"binance_cross_margin": BinanceCrossMarginConfigMap.model_construct()}
