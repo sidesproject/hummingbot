@@ -29,10 +29,10 @@ def _pm_prefix(path_url: str, domain: str) -> str:
     """For PM domain, prefix UM-specific private endpoints with 'um/'."""
     if not _is_pm_domain(domain):
         return path_url
-    # Endpoints that don't need um/ prefix
+    # Endpoints that don't need um/ prefix (market data + account-level)
     no_prefix = {"v1/ping", "v1/time", "v1/premiumIndex", "v1/listenKey",
                  "v1/depth", "v1/ticker/bookTicker", "v1/ticker/24hr", "v1/trades",
-                 "v1/balance"}
+                 "v1/balance", "v1/exchangeInfo"}
     if path_url in no_prefix:
         return path_url
     return f"v1/um/{path_url.split('/', 1)[1]}" if '/' in path_url else f"v1/um/{path_url}"
