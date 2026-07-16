@@ -1,3 +1,4 @@
+import json
 from typing import Callable, Optional
 
 import hummingbot.connector.exchange.binance.binance_constants as CONSTANTS
@@ -46,14 +47,17 @@ def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> s
 
 
 class BinanceRESTPreProcessor(RESTPreProcessorBase):
-    """Sets Content-Type per HTTP method for proper signing."""
+    """Sets Content-Type and ensures POST data is JSON-string for papi compatibility."""
 
     async def pre_process(self, request: RESTRequest) -> RESTRequest:
         if request.headers is None:
             request.headers = {}
+        is_json = request.method == RESTMethod.POST
         request.headers["Content-Type"] = (
-            "application/json" if request.method == RESTMethod.POST else "application/x-www-form-urlencoded"
+            "application/json" if is_json else "application/x-www-form-urlencoded"
         )
+        if is_json and isinstance(request.data, dict):
+            request.data = json.dumps(request.data)
         return request
 
 

@@ -1,3 +1,4 @@
+import ujson
 from typing import Any, Callable, Dict, Optional
 
 import hummingbot.connector.derivative.binance_perpetual.binance_perpetual_constants as CONSTANTS
@@ -15,9 +16,12 @@ class BinancePerpetualRESTPreProcessor(RESTPreProcessorBase):
     async def pre_process(self, request: RESTRequest) -> RESTRequest:
         if request.headers is None:
             request.headers = {}
+        is_json = request.method == RESTMethod.POST
         request.headers["Content-Type"] = (
-            "application/json" if request.method == RESTMethod.POST else "application/x-www-form-urlencoded"
+            "application/json" if is_json else "application/x-www-form-urlencoded"
         )
+        if is_json and isinstance(request.data, dict):
+            request.data = ujson.dumps(request.data)
         return request
 
 
