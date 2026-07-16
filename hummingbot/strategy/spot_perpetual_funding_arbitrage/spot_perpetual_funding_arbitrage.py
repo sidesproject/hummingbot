@@ -500,6 +500,10 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
 
             order_amount = self._quote_to_base(token, alloc_quote, funding_info.index_price)
             if order_amount == s_decimal_zero:
+                self.logger().info(
+                    f"[{token}] Skipping: alloc {alloc_quote:.2f} quote quantized to 0 "
+                    f"(price={funding_info.index_price:.2f}, below min order size)."
+                )
                 continue
 
             if not self._can_afford_on_both_sides(token, order_amount):
@@ -513,6 +517,9 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
                 perp_is_buy=False, spot_is_buy=True, order_amount=order_amount,
             )
             if price_perp is None or price_spot is None:
+                self._log_throttled(token,
+                    f"Failed to get order prices for {order_amount:.6f} {token}. "
+                    f"Will retry next check cycle.")
                 continue
 
             label = "Adding to" if is_addition else "Opening"
@@ -523,11 +530,15 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
 
             proposal = (True, False, price_spot, price_perp, order_amount)
             proposal = self.apply_slippage_buffers(proposal, ts)
-            if self.check_budget_constraint(proposal, ts, order_amount):
-                self._execute_arb_parallel(
-                    ts, proposal,
-                    purpose=ExecPurpose.ADD if is_addition else ExecPurpose.OPEN,
-                )
+            if not self.check_budget_constraint(proposal, ts, order_amount):
+                self._log_throttled(token,
+                    f"Budget constraint failed for {order_amount:.6f} {token}. "
+                    f"Check spot/perpetual balances.")
+                continue
+            self._execute_arb_parallel(
+                ts, proposal,
+                purpose=ExecPurpose.ADD if is_addition else ExecPurpose.OPEN,
+            )
 
     def _log_throttled(self, token: str, msg: str, interval: float = 60):
         last = self._last_log_ts.get(token, 0)
