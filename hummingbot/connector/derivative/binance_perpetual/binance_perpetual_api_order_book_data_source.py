@@ -53,6 +53,9 @@ class BinancePerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
 
     async def get_funding_info(self, trading_pair: str) -> FundingInfo:
+        # premiumIndex provides mark/index price. Rate is seeded from last
+        # settled value; the WS @markPrice stream overrides it with the
+        # real-time predicted rate within seconds.
         symbol_info: Dict[str, Any] = await self._request_complete_funding_info(trading_pair)
         funding_info = FundingInfo(
             trading_pair=trading_pair,

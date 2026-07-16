@@ -177,6 +177,7 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
 
         self._main_task = None
         self._ready_to_start = False
+        self._post_ready_warmup_ticks = 0
         self._last_check_ts: float = 0
         self._last_health_check_ts: float = 0
         self._last_log_ts: Dict[str, float] = {}
@@ -389,6 +390,14 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
 
             self._ready_to_start = True
 
+        if self._ready_to_start:
+            # Wait 5 ticks (5s) for WS to push the first predicted funding rate
+            # before allowing main() to run. This prevents using the stale
+            # historical rate from the REST init.
+            self._post_ready_warmup_ticks += 1
+            if self._post_ready_warmup_ticks < 5:
+                return
+
         if self._ready_to_start and (self._main_task is None or self._main_task.done()):
             self._main_task = safe_ensure_future(self.main(timestamp))
 
@@ -447,7 +456,7 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             spread_pct = (idx_price - mark_price) / mark_price * Decimal("100")
             if spread_pct > self._max_entry_spread_pct:
                 self._log_throttled(token,
-                    f"Entry rejected: spot_buy({price_spot:.2f}) - perp_sell({price_perp:.2f}) "
+                    f"Entry rejected: idx({idx_price:.2f}) - mark({mark_price:.2f}) "
                     f"spread ({spread_pct:.4f}%) exceeds max_entry_spread_pct "
                     f"({self._max_entry_spread_pct:.4f}%).")
                 continue
@@ -469,7 +478,10 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             })
 
         if not eligible:
-            return
+            self.logger().info(
+                f"Entry scan: checked {len(self._tokens)} token(s), 0 eligible. "
+                f"(Rate < {self._min_funding_rate_pct:.4f}% or spread too wide)"
+            )
 
         # ── Phase 2: allocate & execute among eligible pool ──
         pool_rate = s_decimal_zero
@@ -540,7 +552,7 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
                 purpose=ExecPurpose.ADD if is_addition else ExecPurpose.OPEN,
             )
 
-    def _log_throttled(self, token: str, msg: str, interval: float = 60):
+    def _log_throttled(self, token: str, msg: str, interval: float = 15):
         last = self._last_log_ts.get(token, 0)
         if self.current_timestamp - last >= interval:
             self.logger().info(f"[{token}] {msg}")
@@ -1151,6 +1163,7 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             self._main_task.cancel()
             self._main_task = None
         self._ready_to_start = False
+        self._post_ready_warmup_ticks = 0
 
     # ------------------------------------------------------------------
     # Event callbacks
