@@ -326,8 +326,16 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
                 continue
 
             amount = abs(pos.amount)
+            spot_bal = self._spot_market.get_available_balance(token)
             if pos.amount < 0:
-                # Existing SHORT — this is the expected direction
+                # Existing SHORT — check if spot hedge is present
+                if spot_bal == s_decimal_zero:
+                    self.logger().warning(
+                        f"[{token}] Found existing SHORT position ({amount:.6f}) but NO spot "
+                        f"{token} balance. Hedge is broken — keeping Closed, health check "
+                        f"will force-close the naked short."
+                    )
+                    continue
                 ts.state = StrategyState.Opened
                 ts.position_opened_ts = self.current_timestamp
                 fi = self.get_funding_info(ts.perp_trading_pair)
@@ -335,7 +343,8 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
                     ts.entry_funding_rate = fi.rate * Decimal("100")
                 self.logger().info(
                     f"[{token}] Resumed existing SHORT position: {amount:.6f} "
-                    f"@ {pos.entry_price}. Funding rate: {ts.entry_funding_rate:.4f}%."
+                    f"@ {pos.entry_price}. Spot {token}: {spot_bal:.6f}. "
+                    f"Funding rate: {ts.entry_funding_rate:.4f}%."
                 )
             else:
                 # Existing LONG — unexpected for this strategy
@@ -665,7 +674,7 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             pos = self._perp_position_for_token(token)
             has_perp = pos is not None and pos.amount != s_decimal_zero
 
-            # Scenario 1: state says Closed but perp has a position
+            # Scenario 1a: State=Closed but perp position exists → orphan short
             if ts.state == StrategyState.Closed and has_perp:
                 self.logger().warning(
                     f"[{token}] HEALTH CHECK: State=Closed but perp position exists "
@@ -673,6 +682,17 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
                     f"Force-closing perp side to eliminate exposure."
                 )
                 safe_ensure_future(self._force_close_perp_exposure(token, ts, pos))
+
+            # Scenario 1b: State=Opened + perp exists + no spot balance → naked short
+            elif ts.state == StrategyState.Opened and has_perp:
+                spot_bal = self._spot_market.get_available_balance(token)
+                if spot_bal == s_decimal_zero:
+                    self.logger().warning(
+                        f"[{token}] HEALTH CHECK: State=Opened, perp SHORT exists "
+                        f"({pos.amount:.6f}), but spot {token} balance is 0. "
+                        f"Hedge broken — force-closing perp to eliminate naked short."
+                    )
+                    safe_ensure_future(self._force_close_perp_exposure(token, ts, pos))
 
             # Scenario 2: state says Opened but no perp position → orphaned spot
             elif ts.state == StrategyState.Opened and not has_perp:
