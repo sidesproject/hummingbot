@@ -531,8 +531,11 @@ class BinanceExchange(ExchangePyBase):
         for balance_entry in balances:
             asset_name = balance_entry["asset"]
             if is_cross_margin:
-                free_balance = Decimal(balance_entry.get("crossMarginFree", "0"))
-                total_balance = Decimal(balance_entry.get("crossMarginNetAsset", "0"))
+                # Unified account: funds sit in the general pool unless explicitly
+                # allocated to cross margin or UM. Use totalWalletBalance as the
+                # available balance — the exchange auto-allocates as needed.
+                free_balance = Decimal(balance_entry.get("totalWalletBalance", "0"))
+                total_balance = Decimal(balance_entry.get("totalWalletBalance", "0"))
             else:
                 free_balance = Decimal(balance_entry["free"])
                 total_balance = free_balance + Decimal(balance_entry.get("locked", "0"))
