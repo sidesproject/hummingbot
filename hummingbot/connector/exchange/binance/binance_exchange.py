@@ -516,26 +516,39 @@ class BinanceExchange(ExchangePyBase):
             path_url=CONSTANTS.ACCOUNTS_PATH_URL,
             is_auth_required=True)
 
-        # Unified Account (Portfolio Margin) returns "accountEquity" > "assets"
-        # Cross Margin sapi returns "userAssets"
-        # Spot returns "balances"
-        if "accountEquity" in account_info:
-            balances = account_info["accountEquity"]["assets"]
+        # Unified Account (Portfolio Margin): "assets" at top level,
+        #   fields crossMarginFree / crossMarginNetAsset
+        # Cross Margin sapi: "userAssets", fields free / locked / netAsset
+        # Spot: "balances", fields free / locked
+        if "assets" in account_info and "accountEquity" in account_info:
+            # Unified Account format
+            for balance_entry in account_info["assets"]:
+                asset_name = balance_entry["asset"]
+                free_balance = Decimal(balance_entry.get("crossMarginFree", "0"))
+                total_balance = Decimal(balance_entry.get("crossMarginNetAsset", "0"))
+                remote_asset_names.add(asset_name)
+                self._account_available_balances[asset_name] = free_balance
+                self._account_balances[asset_name] = total_balance
         elif "userAssets" in account_info:
-            balances = account_info["userAssets"]
+            # Cross Margin sapi format
+            for balance_entry in account_info["userAssets"]:
+                asset_name = balance_entry["asset"]
+                free_balance = Decimal(balance_entry["free"])
+                total_balance = free_balance + Decimal(balance_entry.get("locked", "0"))
+                if "borrowed" in balance_entry:
+                    total_balance = Decimal(balance_entry.get("netAsset", str(total_balance)))
+                remote_asset_names.add(asset_name)
+                self._account_available_balances[asset_name] = free_balance
+                self._account_balances[asset_name] = total_balance
         else:
-            balances = account_info["balances"]
-
-        for balance_entry in balances:
-            asset_name = balance_entry["asset"]
-            free_balance = Decimal(balance_entry["free"])
-            total_balance = free_balance + Decimal(balance_entry.get("locked", "0"))
-            if "borrowed" in balance_entry:
-                total_balance = Decimal(balance_entry.get("netAsset", str(total_balance)))
-
-            self._account_available_balances[asset_name] = free_balance
-            self._account_balances[asset_name] = total_balance
-            remote_asset_names.add(asset_name)
+            # Spot format
+            for balance_entry in account_info["balances"]:
+                asset_name = balance_entry["asset"]
+                free_balance = Decimal(balance_entry["free"])
+                total_balance = free_balance + Decimal(balance_entry.get("locked", "0"))
+                remote_asset_names.add(asset_name)
+                self._account_available_balances[asset_name] = free_balance
+                self._account_balances[asset_name] = total_balance
 
         asset_names_to_remove = local_asset_names.difference(remote_asset_names)
         for asset_name in asset_names_to_remove:
