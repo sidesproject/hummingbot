@@ -541,14 +541,11 @@ class BinanceExchange(ExchangePyBase):
                 self._account_available_balances[asset_name] = free_balance
                 self._account_balances[asset_name] = total_balance
         else:
-            # Spot format
-            for balance_entry in account_info["balances"]:
-                asset_name = balance_entry["asset"]
-                free_balance = Decimal(balance_entry["free"])
-                total_balance = free_balance + Decimal(balance_entry.get("locked", "0"))
-                remote_asset_names.add(asset_name)
-                self._account_available_balances[asset_name] = free_balance
-                self._account_balances[asset_name] = total_balance
+            # Unknown format — log available keys and skip gracefully
+            self.logger().warning(
+                f"Unknown account info format. Keys: {list(account_info.keys())[:20]}. "
+                f"Skipping balance update."
+            )
 
         asset_names_to_remove = local_asset_names.difference(remote_asset_names)
         for asset_name in asset_names_to_remove:
