@@ -1005,9 +1005,12 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
     def _check_perp_budget(self, ts: TokenState, is_buy: bool, price: Decimal, amount: Decimal) -> bool:
         perp_quote = ts.perp_trading_pair.split("-")[1]
         perp_bal = self._perp_market.get_available_balance(perp_quote)
-        if perp_bal == s_decimal_zero:
-            # Unified margin: perp wallet is 0, spot covers both sides.
-            # The spot budget check already validated total balance.
+        spot_quote = ts.spot_trading_pair.split("-")[1]
+        spot_bal = self._spot_market.get_available_balance(spot_quote)
+
+        # Unified margin: both connectors report same balance from shared pool.
+        # The spot budget check + _can_afford_on_both_sides already validated.
+        if spot_bal > s_decimal_zero and spot_bal == perp_bal:
             return True
 
         bc = self._perp_market.budget_checker
