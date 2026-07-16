@@ -58,10 +58,13 @@ class TokenState:
     execution_tracker: Dict[str, dict] = field(default_factory=dict)
     execution_expected_count: int = 0
     execution_started_ts: float = 0  # for stuck-in-flight detection
+    execution_stage: str = ""  # "primary" | "secondary" (hybrid execution)
+    execution_secondary_params: dict = field(default_factory=dict)
 
 
 
 STUCK_IN_FLIGHT_TIMEOUT = 300  # seconds after which stuck Opening/Closing is force-reset
+PRIMARY_ORDER_TIMEOUT = 30  # seconds after which an unfilled primary LIMIT is cancelled
 
 
 class ExecPurpose:
@@ -678,7 +681,7 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
     # ------------------------------------------------------------------
 
     def update_all_strategy_states(self):
-        """State transitions are handled inside _check_alignment_and_finalize."""
+        """State transitions are handled inside _finalize_state after hybrid execution."""
         pass
 
     # ------------------------------------------------------------------
@@ -780,6 +783,41 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
 
             del self._first_seen_one_sided[key]
 
+        # ── Stuck-in-flight checks (Opening / Closing) ──
+        for token in self._tokens:
+            ts = self._ts_for(token)
+            if ts.state not in (StrategyState.Opening, StrategyState.Closing):
+                continue
+            if ts.execution_started_ts <= 0:
+                continue
+            stuck = self.current_timestamp - ts.execution_started_ts
+
+            if ts.execution_stage == "primary" and stuck > PRIMARY_ORDER_TIMEOUT:
+                self.logger().warning(
+                    f"[{token}] HEALTH CHECK: Primary LIMIT unfilled for "
+                    f"{stuck:.0f}s (> {PRIMARY_ORDER_TIMEOUT}s). Cancelling and resetting."
+                )
+                for oid in list(ts.execution_tracker.keys()):
+                    try:
+                        self._spot_market.cancel(ts.spot_trading_pair, oid)
+                    except Exception:
+                        pass
+                self._reset_execution(ts, ts.execution_purpose)
+
+            elif stuck > STUCK_IN_FLIGHT_TIMEOUT:
+                self.logger().warning(
+                    f"[{token}] HEALTH CHECK: Stuck in {ts.state.name} for "
+                    f"{stuck:.0f}s (> {STUCK_IN_FLIGHT_TIMEOUT}s). Force-resetting."
+                )
+                ts.execution_tracker.clear()
+                ts.execution_expected_count = 0
+                ts.execution_stage = ""
+                ts.execution_secondary_params.clear()
+                if ts.state == StrategyState.Opening:
+                    ts.state = StrategyState.Closed
+                else:
+                    ts.state = StrategyState.Opened
+
     async def _force_close_perp_exposure(self, token: str, ts: TokenState, pos: Position):
         """Submit a market order to close an orphaned perp position."""
         is_short = pos.amount < 0
@@ -814,43 +852,44 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
         ts.accumulated_funding = Decimal(0)
 
     # ------------------------------------------------------------------
-    # Execution: parallel orders + alignment + rollback
+    # Execution: hybrid (primary LIMIT → secondary MARKET)
     # ------------------------------------------------------------------
 
     def _execute_arb_parallel(self, ts: TokenState, proposal: Tuple, purpose: str):
+        """Hybrid execution: primary leg as LIMIT, secondary leg as MARKET.
+
+        OPEN / ADD:  spot LIMIT (primary) → perp MARKET with exact fill amount
+        CLOSE:       spot LIMIT (primary) → perp MARKET with exact fill amount
+
+        The primary leg uses a LIMIT order to save on maker fees.
+        Once it fills, the secondary leg is placed at MARKET with the exact
+        filled amount — guaranteeing delta neutrality without an alignment step.
+        """
         spot_is_buy, perp_is_buy, spot_price, perp_price, order_amount = proposal
         if order_amount == s_decimal_zero:
             return
 
         ts.execution_tracker.clear()
         ts.execution_purpose = purpose
-        ts.execution_expected_count = 2
+        ts.execution_stage = "primary"
+        ts.execution_expected_count = 1
         ts.execution_started_ts = self.current_timestamp
+        ts.execution_secondary_params = {
+            "perp_is_buy": perp_is_buy,
+            "perp_price": perp_price,
+            "position_action": PositionAction.CLOSE if purpose == ExecPurpose.CLOSE else PositionAction.OPEN,
+        }
 
         side_s = "BUY" if spot_is_buy else "SELL"
         self.logger().info(
-            f"[{ts.token}] {side_s} {order_amount:.6f} spot @ {spot_price:.2f}"
+            f"[{ts.token}] Primary: {side_s} {order_amount:.6f} spot LIMIT @ {spot_price:.2f}"
         )
         spot_fn = self.buy_with_specific_market if spot_is_buy else self.sell_with_specific_market
         spot_fn(
             ts.spot_tuple,
             order_amount,
-            self._spot_market.get_taker_order_type(),
+            OrderType.LIMIT,
             spot_price,
-        )
-
-        side_p = "BUY" if perp_is_buy else "SELL"
-        pa = PositionAction.CLOSE if purpose == ExecPurpose.CLOSE else PositionAction.OPEN
-        self.logger().info(
-            f"[{ts.token}] {side_p} {order_amount:.6f} perp @ {perp_price:.2f} ({pa.name})"
-        )
-        perp_fn = self.buy_with_specific_market if perp_is_buy else self.sell_with_specific_market
-        perp_fn(
-            ts.perp_tuple,
-            order_amount,
-            self._perp_market.get_taker_order_type(),
-            perp_price,
-            position_action=pa,
         )
 
         if purpose == ExecPurpose.OPEN:
@@ -858,11 +897,6 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
         elif purpose == ExecPurpose.CLOSE:
             ts.state = StrategyState.Closing
         # For ADD, keep current state (Opened)
-
-        self.logger().info(
-            f"[{ts.token}] 2 orders placed (purpose={purpose}). "
-            f"Awaiting fills for {order_amount:.6f} {ts.token}."
-        )
 
     def _record_order_created(self, ts: TokenState, order_id: str, side: str, direction: TradeType):
         if ts.execution_expected_count == 0:
@@ -872,103 +906,112 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             "direction": direction,
             "filled_amount": s_decimal_zero,
             "completed": False,
+            "stage": ts.execution_stage,
         }
 
     def _record_order_fill(self, ts: TokenState, order_id: str, filled_amount: Decimal):
+        """Primary fill → launch secondary MARKET with exact amount.
+        Secondary fill → finalize (no alignment needed).
+        """
         if order_id not in ts.execution_tracker:
             ts.execution_tracker[order_id] = {
                 "side": "unknown",
                 "direction": None,
                 "filled_amount": s_decimal_zero,
                 "completed": False,
+                "stage": "unknown",
             }
         ts.execution_tracker[order_id]["filled_amount"] = filled_amount
         ts.execution_tracker[order_id]["completed"] = True
+        stage = ts.execution_tracker[order_id].get("stage", "unknown")
 
-        filled_count = sum(1 for v in ts.execution_tracker.values() if v["completed"])
-        if filled_count >= ts.execution_expected_count:
-            self._check_alignment_and_finalize(ts)
+        if stage == "primary":
+            # Primary LIMIT filled — launch secondary MARKET with exact amount
+            self.logger().info(
+                f"[{ts.token}] Primary filled: {filled_amount:.8f}. "
+                f"Launching secondary MARKET with exact same amount."
+            )
+            self._launch_secondary_leg(ts, filled_amount)
+
+        elif stage == "secondary":
+            self.logger().info(
+                f"[{ts.token}] Secondary filled: {filled_amount:.8f}. "
+                f"Execution complete, delta neutral."
+            )
+            self._finalize_state(ts)
+            ts.execution_tracker.clear()
+            ts.execution_expected_count = 0
+
+    def _launch_secondary_leg(self, ts: TokenState, primary_filled_amount: Decimal):
+        """Place the perp MARKET order matching the primary fill exactly."""
+        params = ts.execution_secondary_params
+        perp_is_buy = params["perp_is_buy"]
+        pa = params["position_action"]
+
+        side_p = "BUY" if perp_is_buy else "SELL"
+        self.logger().info(
+            f"[{ts.token}] Secondary: {side_p} {primary_filled_amount:.8f} perp MARKET ({pa.name})"
+        )
+        perp_fn = self.buy_with_specific_market if perp_is_buy else self.sell_with_specific_market
+        perp_fn(
+            ts.perp_tuple,
+            primary_filled_amount,
+            self._perp_market.get_taker_order_type(),
+            position_action=pa,
+        )
+        ts.execution_stage = "secondary"
+        ts.execution_expected_count = 1
+        ts.execution_tracker.clear()
 
     def _handle_order_failure(self, ts: TokenState, order_id: str):
         if order_id not in ts.execution_tracker:
             return
-        failed_side = ts.execution_tracker[order_id]["side"]
+        failed_stage = ts.execution_tracker[order_id].get("stage", "unknown")
         purpose = ts.execution_purpose
-        self.logger().error(f"[{ts.token}] Order {order_id} ({failed_side}) FAILED (purpose={purpose}). Rolling back.")
+        self.logger().error(
+            f"[{ts.token}] Order {order_id} FAILED (stage={failed_stage}, purpose={purpose})."
+        )
 
-        for oid, info in ts.execution_tracker.items():
-            if oid != order_id and info["completed"] and info["filled_amount"] > s_decimal_zero:
-                other_side = info["side"]
-                other_amount = info["filled_amount"]
-                other_direction = info["direction"]
-                self.logger().warning(f"[{ts.token}] Rolling back {other_side} — reverse order for {other_amount}.")
-                self._submit_rollback_order(ts, other_side, other_direction, other_amount)
-                break
+        if failed_stage == "primary":
+            # No fill yet → no exposure, safe to just reset
+            self.logger().info(f"[{ts.token}] Primary failed before fill, no exposure. Resetting.")
+            self._reset_execution(ts, purpose)
+        elif failed_stage == "secondary":
+            # Primary already filled, secondary failed → have spot exposure now
+            self.logger().warning(
+                f"[{ts.token}] Secondary failed after primary filled — "
+                f"rolling back primary fill."
+            )
+            # Find the primary fill to reverse it
+            for oid, info in ts.execution_tracker.items():
+                if info.get("stage") == "primary" and info.get("completed"):
+                    filled_amount = info["filled_amount"]
+                    side = info["side"]
+                    direction = info["direction"]
+                    if side == "spot" and filled_amount > s_decimal_zero:
+                        reverse_buy = direction != TradeType.BUY
+                        self.logger().warning(
+                            f"[{ts.token}] Rollback: {'BUY' if reverse_buy else 'SELL'} "
+                            f"{filled_amount:.8f} spot to reverse primary fill."
+                        )
+                        fn = self.buy_with_specific_market if reverse_buy else self.sell_with_specific_market
+                        fn(ts.spot_tuple, filled_amount, self._spot_market.get_taker_order_type())
+                        break
+            self._reset_execution(ts, purpose)
 
+    def _reset_execution(self, ts: TokenState, purpose: str):
         ts.execution_tracker.clear()
         ts.execution_expected_count = 0
+        ts.execution_stage = ""
+        ts.execution_secondary_params.clear()
         if purpose == ExecPurpose.OPEN:
             ts.state = StrategyState.Closed
-            self.logger().info(f"[{ts.token}] Entry rollback. State → Closed.")
+            self.logger().info(f"[{ts.token}] State → Closed.")
         elif purpose == ExecPurpose.CLOSE:
             ts.state = StrategyState.Opened
-            self.logger().warning(f"[{ts.token}] Close rollback. State → Opened, will retry.")
+            self.logger().warning(f"[{ts.token}] State → Opened, will retry close.")
         elif purpose == ExecPurpose.ADD:
-            # Addition failed — just reset, stay Opened
-            self.logger().info(f"[{ts.token}] Addition rollback. State stays Opened.")
-
-    def _check_alignment_and_finalize(self, ts: TokenState):
-        spot_filled = s_decimal_zero
-        perp_filled = s_decimal_zero
-        spot_direction = None
-        perp_direction = None
-
-        for oid, info in ts.execution_tracker.items():
-            if info["side"] == "spot":
-                spot_filled += info["filled_amount"]
-                spot_direction = info["direction"]
-            elif info["side"] == "perp":
-                perp_filled += info["filled_amount"]
-                perp_direction = info["direction"]
-            else:
-                self.logger().warning(f"[{ts.token}] Unknown side '{info['side']}' for order {oid}. Skipping alignment.")
-                ts.execution_tracker.clear()
-                ts.execution_expected_count = 0
-                return
-
-        diff = spot_filled - perp_filled
-        self.logger().info(f"[{ts.token}] Fill check — Spot: {spot_filled:.8f}, Perp: {perp_filled:.8f}, Diff: {diff:.8f}")
-
-        # If diff is smaller than spot min order size, accept as aligned —
-        # a catch-up order would be rejected by the exchange anyway.
-        spot_min = self._spot_market.quantize_order_amount(ts.spot_trading_pair, s_decimal_zero)
-        if spot_min == s_decimal_zero:
-            try:
-                rule = self._spot_market.trading_rules.get(ts.spot_trading_pair)
-                if rule is not None:
-                    spot_min = rule.min_order_size
-            except Exception:
-                pass
-        if spot_min == s_decimal_zero:
-            spot_min = Decimal("0.00000001")
-
-        abs_diff = abs(diff)
-        if abs_diff == s_decimal_zero:
-            self.logger().info(f"[{ts.token}] Both sides exactly aligned.")
-        elif abs_diff < spot_min:
-            self.logger().info(
-                f"[{ts.token}] Diff ({abs_diff:.8f}) < min order size ({spot_min:.8f}) "
-                f"— treating as aligned."
-            )
-        else:
-            if diff > 0:
-                self.logger().info(f"[{ts.token}] Perp short by {abs_diff:.8f}. Catching up.")
-                self._submit_catch_up_perpetual(ts, perp_direction, abs_diff)
-            else:
-                self.logger().info(f"[{ts.token}] Spot short by {abs_diff:.8f}. Catching up.")
-                self._submit_catch_up_spot(ts, spot_direction, abs_diff)
-
-        self._finalize_state(ts)
+            self.logger().info(f"[{ts.token}] Addition failed, State stays Opened.")
 
     def _finalize_state(self, ts: TokenState):
         purpose = ts.execution_purpose
@@ -995,28 +1038,8 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
 
         ts.execution_tracker.clear()
         ts.execution_expected_count = 0
-
-    def _submit_catch_up_spot(self, ts: TokenState, direction: TradeType, amount: Decimal):
-        is_buy = direction == TradeType.BUY
-        fn = self.buy_with_specific_market if is_buy else self.sell_with_specific_market
-        fn(ts.spot_tuple, amount, self._spot_market.get_taker_order_type())
-
-    def _submit_catch_up_perpetual(self, ts: TokenState, direction: TradeType, amount: Decimal):
-        is_buy = direction == TradeType.BUY
-        pa = PositionAction.CLOSE if ts.execution_purpose == ExecPurpose.CLOSE else PositionAction.OPEN
-        fn = self.buy_with_specific_market if is_buy else self.sell_with_specific_market
-        fn(ts.perp_tuple, amount, self._perp_market.get_taker_order_type(), position_action=pa)
-
-    def _submit_rollback_order(self, ts: TokenState, side: str, original_direction: TradeType, amount: Decimal):
-        reverse_buy = original_direction != TradeType.BUY
-        if side == "spot":
-            fn = self.buy_with_specific_market if reverse_buy else self.sell_with_specific_market
-            fn(ts.spot_tuple, amount, self._spot_market.get_taker_order_type())
-        else:
-            fn = self.buy_with_specific_market if reverse_buy else self.sell_with_specific_market
-            fn(ts.perp_tuple, amount, self._perp_market.get_taker_order_type(),
-               position_action=PositionAction.CLOSE)
-        self.logger().warning(f"[{ts.token}] Rollback: {side} {'BUY' if reverse_buy else 'SELL'} {amount}.")
+        ts.execution_stage = ""
+        ts.execution_secondary_params.clear()
 
     # ------------------------------------------------------------------
     # Slippage / budget
