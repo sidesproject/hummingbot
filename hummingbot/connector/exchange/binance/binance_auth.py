@@ -22,12 +22,17 @@ class BinanceAuth(AuthBase):
         the required parameter in the request header.
         :param request: the request to be configured for authenticated interaction
         """
+        import logging
+        _log = logging.getLogger(__name__)
+
+        _log.warning(f"[AUTH DEBUG] method={request.method}, url={request.url[:80]}, "
+                     f"data_type={type(request.data).__name__}, "
+                     f"data_len={len(str(request.data))}, "
+                     f"data_preview={str(request.data)[:400]}")
+
         is_json = (request.headers or {}).get("Content-Type") == "application/json"
         if request.method == RESTMethod.POST:
             params = request.data
-            # Unwrap: rest_assistant json.dumps + RESTRequest._ensure_data can
-            # double-encode, leaving data as a JSON-encoded JSON string.
-            # Also handle the case where a pre_processor already decoded to dict.
             if isinstance(params, str):
                 params = json.loads(params)
             if isinstance(params, str):
@@ -44,6 +49,8 @@ class BinanceAuth(AuthBase):
         headers.update(self.header_for_authentication())
         request.headers = headers
 
+        _log.warning(f"[AUTH DEBUG] AFTER: data_type={type(request.data).__name__}, "
+                     f"data_preview={str(request.data)[:400]}")
         return request
 
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:

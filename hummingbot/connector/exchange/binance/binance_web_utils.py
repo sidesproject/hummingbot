@@ -56,6 +56,12 @@ class BinanceRESTPreProcessor(RESTPreProcessorBase):
         request.headers["Content-Type"] = (
             "application/json" if is_json else "application/x-www-form-urlencoded"
         )
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.warning(f"[PRE DEBUG] method={request.method}, url={str(request.url)[:80]}, "
+                     f"data_type={type(request.data).__name__}, "
+                     f"data_len={len(str(request.data))}, "
+                     f"data_preview={str(request.data)[:400]}")
         return request
 
 
