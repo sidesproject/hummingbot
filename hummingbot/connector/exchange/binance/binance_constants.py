@@ -3,6 +3,7 @@ from hummingbot.core.data_type.in_flight_order import OrderState
 
 DEFAULT_DOMAIN = "com"
 CROSS_MARGIN_DOMAIN = "binance_cross_margin"
+PM_DOMAIN = "papi"
 
 HBOT_ORDER_ID_PREFIX = "x-MG43PCSN"
 MAX_ORDER_ID_LEN = 32
