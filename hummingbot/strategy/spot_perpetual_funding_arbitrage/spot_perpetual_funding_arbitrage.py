@@ -62,6 +62,7 @@ class TokenState:
 
 
 STUCK_IN_FLIGHT_TIMEOUT = 300  # seconds after which stuck Opening/Closing is force-reset
+DEBUG_SKIP_PERP = True  # TODO: remove after spot order debugging
 
 
 class ExecPurpose:
@@ -797,8 +798,13 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
 
         ts.execution_tracker.clear()
         ts.execution_purpose = purpose
-        ts.execution_expected_count = 2
         ts.execution_started_ts = self.current_timestamp
+
+        if DEBUG_SKIP_PERP:
+            self.logger().warning(f"[{ts.token}] DEBUG_SKIP_PERP=True — only placing spot order.")
+            ts.execution_expected_count = 1
+        else:
+            ts.execution_expected_count = 2
 
         side_s = "BUY" if spot_is_buy else "SELL"
         self.logger().info(
@@ -811,6 +817,10 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             self._spot_market.get_taker_order_type(),
             spot_price,
         )
+
+        if DEBUG_SKIP_PERP:
+            self.logger().warning(f"[{ts.token}] Skipping perp order (DEBUG_SKIP_PERP=True).")
+            return
 
         side_p = "BUY" if perp_is_buy else "SELL"
         pa = PositionAction.CLOSE if purpose == ExecPurpose.CLOSE else PositionAction.OPEN
@@ -891,6 +901,12 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             self.logger().info(f"[{ts.token}] Addition rollback. State stays Opened.")
 
     def _check_alignment_and_finalize(self, ts: TokenState):
+        if DEBUG_SKIP_PERP:
+            self._finalize_state(ts)
+            ts.execution_tracker.clear()
+            ts.execution_expected_count = 0
+            return
+
         spot_filled = s_decimal_zero
         perp_filled = s_decimal_zero
         spot_direction = None
@@ -925,7 +941,9 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
                 self.logger().info(f"[{ts.token}] Spot short by {catch_amount:.8f}. Catching up.")
                 self._submit_catch_up_spot(ts, spot_direction, catch_amount)
 
-        # State transition by purpose
+        self._finalize_state(ts)
+
+    def _finalize_state(self, ts: TokenState):
         purpose = ts.execution_purpose
         if purpose == ExecPurpose.OPEN:
             ts.state = StrategyState.Opened
