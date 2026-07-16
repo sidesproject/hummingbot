@@ -571,17 +571,35 @@ class BinancePerpetualDerivative(PerpetualDerivativePyBase):
     async def _update_balances(self):
         """
         Calls the REST API to update total and available balances.
+        For PM domain uses /papi/v1/balance (returns plain array).
         """
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
 
-        account_info = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL,
-                                           is_auth_required=True)
-        assets = account_info.get("assets")
-        for asset in assets:
-            asset_name = asset.get("asset")
-            available_balance = Decimal(asset.get("availableBalance"))
-            wallet_balance = Decimal(asset.get("walletBalance"))
+        is_pm = self._domain == CONSTANTS.PM_DOMAIN
+        path_url = CONSTANTS.PM_BALANCE_URL if is_pm else CONSTANTS.ACCOUNT_INFO_URL
+        limit_id = CONSTANTS.ACCOUNT_INFO_URL  # reuse existing rate limit entry
+
+        account_info = await self._api_get(path_url=path_url,
+                                           is_auth_required=True,
+                                           limit_id=limit_id)
+
+        if is_pm:
+            # PM /balance returns a plain array
+            balances = account_info
+        else:
+            balances = account_info.get("assets", [])
+
+        for balance_entry in balances:
+            asset_name = balance_entry.get("asset")
+            if is_pm:
+                # PM format: totalWalletBalance and crossMarginFree
+                available_balance = Decimal(balance_entry.get("totalWalletBalance", "0"))
+                wallet_balance = Decimal(balance_entry.get("totalWalletBalance", "0"))
+            else:
+                available_balance = Decimal(balance_entry.get("availableBalance", "0"))
+                wallet_balance = Decimal(balance_entry.get("walletBalance", "0"))
+
             self._account_available_balances[asset_name] = available_balance
             self._account_balances[asset_name] = wallet_balance
             remote_asset_names.add(asset_name)

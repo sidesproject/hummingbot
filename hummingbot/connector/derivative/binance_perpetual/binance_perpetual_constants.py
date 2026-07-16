@@ -50,6 +50,8 @@ GET_POSITION_MODE_LIMIT_ID = f"GET{CHANGE_POSITION_MODE_URL}"
 
 # Private API v2 Endpoints
 ACCOUNT_INFO_URL = "v2/account"
+# PM unified account balance endpoint (replaces v2/account for PM domain)
+PM_BALANCE_URL = "v1/balance"
 POSITION_INFORMATION_URL = "v2/positionRisk"
 
 # Private API Endpoints
