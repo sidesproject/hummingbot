@@ -926,10 +926,9 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
         stage = ts.execution_tracker[order_id].get("stage", "unknown")
 
         if stage == "primary":
-            # Primary LIMIT filled — launch secondary MARKET with exact amount
             self.logger().info(
                 f"[{ts.token}] Primary filled: {filled_amount:.8f}. "
-                f"Launching secondary MARKET with exact same amount."
+                f"Launching secondary MARKET with quantized amount."
             )
             self._launch_secondary_leg(ts, filled_amount)
 
@@ -943,22 +942,50 @@ class SpotPerpetualFundingArbitrageStrategy(StrategyPyBase):
             ts.execution_expected_count = 0
 
     def _launch_secondary_leg(self, ts: TokenState, primary_filled_amount: Decimal):
-        """Place the perp MARKET order matching the primary fill exactly."""
+        """Place the perp MARKET order matching the primary fill, quantized to perp step size.
+
+        Excess spot beyond perp step is sold to maintain delta neutrality.
+        """
         params = ts.execution_secondary_params
         perp_is_buy = params["perp_is_buy"]
         pa = params["position_action"]
 
+        # Quantize to perp step size — perp side is always coarser
+        perp_amount = self._perp_market.quantize_order_amount(
+            ts.perp_trading_pair, primary_filled_amount
+        )
+        if perp_amount == s_decimal_zero:
+            self.logger().error(
+                f"[{ts.token}] Primary filled {primary_filled_amount:.8f} but quantized "
+                f"to 0 on perp side. Cannot open delta-neutral position. Rolling back."
+            )
+            # Sell the primary fill back
+            reverse_buy = not (ts.execution_secondary_params.get("spot_is_buy", True))
+            fn = self.buy_with_specific_market if reverse_buy else self.sell_with_specific_market
+            fn(ts.spot_tuple, primary_filled_amount, self._spot_market.get_taker_order_type())
+            self._reset_execution(ts, ts.execution_purpose)
+            return
+
         side_p = "BUY" if perp_is_buy else "SELL"
         self.logger().info(
-            f"[{ts.token}] Secondary: {side_p} {primary_filled_amount:.8f} perp MARKET ({pa.name})"
+            f"[{ts.token}] Secondary: {side_p} {perp_amount:.8f} perp MARKET ({pa.name})"
         )
         perp_fn = self.buy_with_specific_market if perp_is_buy else self.sell_with_specific_market
         perp_fn(
             ts.perp_tuple,
-            primary_filled_amount,
+            perp_amount,
             self._perp_market.get_taker_order_type(),
             position_action=pa,
         )
+
+        # Quantization may produce a small diff (< min_order_size).
+        # The health check monitors for meaningful one-sided exposure.
+        diff = primary_filled_amount - perp_amount
+        if abs(diff) > s_decimal_zero:
+            self.logger().info(
+                f"[{ts.token}] Quantization diff: {diff:.8f} (primary fill vs. perp step)."
+            )
+
         ts.execution_stage = "secondary"
         ts.execution_expected_count = 1
         ts.execution_tracker.clear()
