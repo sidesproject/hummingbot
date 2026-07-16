@@ -13,7 +13,8 @@ WSS_URL = "wss://stream.binance.{}:9443/ws"
 WSS_API_URL = "wss://ws-api.binance.{}:443/ws-api/v3"
 
 # Cross Margin base URL (for Unified Account — uses Portfolio Margin API)
-CROSS_MARGIN_REST_URL = "https://papi.binance.com/papi/v1/"
+CROSS_MARGIN_REST_URL = "https://papi.binance.com/papi/v1/margin/"
+PAPI_BASE_URL = "https://papi.binance.com/papi/v1/"
 
 PUBLIC_API_VERSION = "v3"
 PRIVATE_API_VERSION = "v3"

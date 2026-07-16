@@ -33,7 +33,14 @@ def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> s
     :return: the full URL to the endpoint
     """
     if _is_cross_margin(domain):
-        return CONSTANTS.CROSS_MARGIN_REST_URL + path_url.lstrip("/")
+        # Unified account: trading goes through /margin/order,
+        # account-level endpoints (balance, listenKey, myTrades) go through papi/ directly
+        clean = path_url.lstrip("/")
+        papi_direct_prefixes = ("balance", "listenKey")
+        if clean in papi_direct_prefixes or \
+           any(clean.endswith("/" + p) or clean == p for p in papi_direct_prefixes):
+            return CONSTANTS.PAPI_BASE_URL + clean
+        return CONSTANTS.CROSS_MARGIN_REST_URL + clean
     return CONSTANTS.REST_URL.format(domain) + CONSTANTS.PRIVATE_API_VERSION + path_url
 
 
