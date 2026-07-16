@@ -156,12 +156,13 @@ class BinanceExchange(ExchangePyBase):
             from hummingbot.connector.derivative.binance_perpetual.binance_perpetual_auth import (
                 BinancePerpetualAuth,
             )
+            from hummingbot.connector.derivative.binance_perpetual import binance_perpetual_constants as PM_CONSTANTS
             pm_auth = BinancePerpetualAuth(self.api_key, self.secret_key, self._time_synchronizer)
             return BinancePerpetualUserStreamDataSource(
                 auth=pm_auth,
                 connector=self,
                 api_factory=self._web_assistants_factory,
-                domain=CONSTANTS.PM_DOMAIN,
+                domain=PM_CONSTANTS.PM_DOMAIN,
             )
         return BinanceAPIUserStreamDataSource(
             auth=self._auth,
